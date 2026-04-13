@@ -124,6 +124,10 @@ class ServerGroup:
                 }.items()
             }
 
+            external_model_package = os.environ.get("SLIME_SGLANG_EXTERNAL_MODEL_PACKAGE")
+            if external_model_package:
+                env_vars["SGLANG_EXTERNAL_MODEL_PACKAGE"] = external_model_package
+
             rollout_engine = RolloutRayActor.options(
                 num_cpus=num_cpus,
                 num_gpus=num_gpus,

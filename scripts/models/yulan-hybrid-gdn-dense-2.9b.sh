@@ -1,0 +1,30 @@
+MODEL_ARGS=(
+   --spec "slime_plugins.models.yulan_mini" "get_yulan_mini_spec"
+   --swiglu
+   --num-layers 56
+   --hidden-size 1920
+   --ffn-hidden-size 4800
+   --num-attention-heads 30
+   --group-query-attention
+   --num-query-groups 6
+   --position-embedding-type rope
+   --disable-bias-linear
+   --normalization RMSNorm
+   --norm-epsilon 1e-6
+   --rotary-base 640000
+   --rotary-percent 1.0
+   --untie-embeddings-and-output-weights
+   --vocab-size 99000
+   --make-vocab-size-divisible-by 1
+   --kv-channels 64
+   --add-qkv-bias
+   --num-experts 0
+   --linear-attention-type gated_delta_net
+   --linear-conv-kernel-dim 4
+   --linear-key-head-dim 64
+   --linear-value-head-dim 64
+   --linear-num-key-heads 8
+   --linear-num-value-heads 32
+   --linear-attention-freq "[1,1,1,1,1,1,1,1,1,1,1,1,0,1,1,1,1,1,1,1,0,0,1,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,1,0,0,1,1,1,1,1,1]"
+   --gdn-cp-impl chunk
+)

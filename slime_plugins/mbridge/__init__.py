@@ -6,6 +6,7 @@ from .gpt_oss import GptOssBridge
 from .mimo import MimoBridge
 from .qwen3_5 import Qwen3_5Bridge
 from .qwen3_next import Qwen3NextBridge
+from .yulan_mini import YuLanMiniBridge
 
 __all__ = [
     "GLM4Bridge",
@@ -13,6 +14,7 @@ __all__ = [
     "GLM4MoELiteBridge",
     "GptOssBridge",
     "Qwen3NextBridge",
+    "YuLanMiniBridge",
     "Qwen3_5Bridge",
     "MimoBridge",
     "DeepseekV32Bridge",
