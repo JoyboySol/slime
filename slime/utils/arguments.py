@@ -987,6 +987,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="On-policy distillation KL penalty coefficient. Default is 1.0.",
             )
             parser.add_argument(
+                "--opd-alignment",
+                type=str,
+                choices=["token", "byte_chunk"],
+                default="token",
+                help=(
+                    "Alignment space used by OPD. "
+                    "'token': existing token-level matching. "
+                    "'byte_chunk': align teacher/student on UTF-8 byte chunks for cross-tokenizer OPD."
+                ),
+            )
+            parser.add_argument(
                 "--opd-teacher-load",
                 type=str,
                 default=None,
@@ -997,6 +1008,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument(
                 "--opd-teacher-ckpt-step", type=int, default=None, help="The checkpoint step for OPD teacher model."
+            )
+            parser.add_argument(
+                "--opd-teacher-hf-checkpoint",
+                type=str,
+                default=None,
+                help=(
+                    "HF checkpoint/tokenizer path for the OPD teacher tokenizer. "
+                    "Required when --opd-alignment=byte_chunk."
+                ),
             )
             return parser
 
@@ -1518,6 +1538,12 @@ def slime_validate_args(args):
     if args.use_opd:
         if args.opd_type is None:
             raise ValueError("--opd-type must be specified when --use-opd is enabled. Choose 'sglang' or 'megatron'.")
+
+        if args.opd_alignment == "byte_chunk" and args.opd_teacher_hf_checkpoint is None:
+            raise ValueError(
+                "--opd-teacher-hf-checkpoint is required when --opd-alignment=byte_chunk. "
+                "Please provide the teacher tokenizer/HF checkpoint path."
+            )
 
         if args.opd_type == "megatron":
             if args.opd_teacher_load is None:

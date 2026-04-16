@@ -27,6 +27,9 @@ class Sample:
     rollout_routed_experts: list[list[int]] | None = None  # Routed experts from rollout engine
     remove_sample: bool = False
     teacher_log_probs: list[float] | None = None  # Log probabilities from teacher model for OPD
+    opd_full_text: str | None = None  # Canonical full text used for byte_chunk OPD teacher scoring
+    opd_prompt_text: str | None = None  # Canonical prompt text used by byte_chunk OPD teacher requests
+    opd_response_text: str | None = None  # Canonical response text used by byte_chunk OPD teacher requests
 
     class Status(Enum):
         PENDING = "pending"

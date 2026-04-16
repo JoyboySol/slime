@@ -21,6 +21,7 @@ from slime.utils.distributed_utils import get_gloo_group, init_process_group
 from slime.utils.logging_utils import init_tracking
 from slime.utils.memory_utils import clear_memory, print_memory
 from slime.utils.misc import Box
+from slime.utils.opd_utils import build_token_byte_spans, clip_token_bytes_by_region, decode_token_ids, encode_text
 from slime.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
 from slime.utils.routing_replay import RoutingReplay
 from slime.utils.timer import Timer, inverse_timer, timer, with_defer
@@ -71,6 +72,12 @@ class MegatronTrainRayActor(TrainRayActor):
             if i == dist.get_rank() % args.num_gpus_per_node:
                 self.hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
                 self.tokenizer = AutoTokenizer.from_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
+                self.opd_teacher_tokenizer = None
+                if args.use_opd and getattr(args, "opd_alignment", "token") == "byte_chunk":
+                    self.opd_teacher_tokenizer = AutoTokenizer.from_pretrained(
+                        args.opd_teacher_hf_checkpoint,
+                        trust_remote_code=True,
+                    )
             dist.barrier(group=get_gloo_group())
 
         self.train_parallel_config = {
@@ -184,15 +191,7 @@ class MegatronTrainRayActor(TrainRayActor):
         reload_process_groups()
         print_memory("after wake_up model")
 
-    def _get_rollout_data(self, rollout_data_ref: Box) -> RolloutBatch:
-        # Fetch data through ray on CPU, not sure if this will be performance bottleneck.
-        # Both first pp stage and the last pp stage will receive the data.
-        rollout_data = process_rollout_data(
-            self.args,
-            rollout_data_ref,
-            mpu.get_data_parallel_rank(with_context_parallel=False),
-            mpu.get_data_parallel_world_size(with_context_parallel=False),
-        )
+    def _prepare_rollout_data(self, rollout_data: RolloutBatch) -> RolloutBatch:
         # TODO: this is ugly, move to somewhere else?
         # move tokens to GPU in advance
         rollout_data["tokens"] = [
@@ -232,6 +231,12 @@ class MegatronTrainRayActor(TrainRayActor):
         for key in ["rollout_log_probs", "teacher_log_probs"]:
             if key not in rollout_data:
                 continue
+            if key == "teacher_log_probs" and getattr(self.args, "opd_alignment", "token") == "byte_chunk":
+                rollout_data[key] = [
+                    torch.tensor(log_prob, device=torch.cuda.current_device(), dtype=torch.float32)
+                    for log_prob in rollout_data[key]
+                ]
+                continue
             rollout_data[key] = [
                 torch.tensor(
                     slice_log_prob_with_cp(
@@ -259,11 +264,70 @@ class MegatronTrainRayActor(TrainRayActor):
             ]
         return rollout_data
 
+    def _get_rollout_data(self, rollout_data_ref: Box) -> RolloutBatch:
+        # Fetch data through ray on CPU, not sure if this will be performance bottleneck.
+        # Both first pp stage and the last pp stage will receive the data.
+        rollout_data = process_rollout_data(
+            self.args,
+            rollout_data_ref,
+            mpu.get_data_parallel_rank(with_context_parallel=False),
+            mpu.get_data_parallel_world_size(with_context_parallel=False),
+        )
+        return self._prepare_rollout_data(rollout_data)
+
     def _switch_model(self, target_tag: str) -> None:
         if target_tag not in self.weights_backuper.backup_tags:
             raise ValueError(f"Cannot switch to unknown model tag: {target_tag}")
         self.weights_backuper.restore(target_tag)
         self._active_model_tag = target_tag
+
+    def _build_cross_tokenizer_teacher_rollout_data(self, rollout_data: RolloutBatch) -> RolloutBatch:
+        if self.opd_teacher_tokenizer is None:
+            raise ValueError("Teacher tokenizer is required for byte_chunk OPD alignment.")
+
+        teacher_tokens = []
+        teacher_response_lengths = []
+        teacher_loss_masks = []
+        full_texts = rollout_data.get("opd_full_texts")
+        prompt_texts = rollout_data.get("opd_prompt_texts")
+        response_texts = rollout_data.get("opd_response_texts")
+
+        for i, (tokens, response_length) in enumerate(zip(rollout_data["tokens"], rollout_data["response_lengths"], strict=False)):
+            if full_texts is not None:
+                full_text = full_texts[i]
+            else:
+                if prompt_texts is not None and response_texts is not None:
+                    full_text = prompt_texts[i] + response_texts[i]
+                else:
+                    full_text = decode_token_ids(self.tokenizer, tokens.tolist())
+
+            student_token_bytes, student_token_spans = build_token_byte_spans(self.tokenizer, full_text, tokens.tolist())
+            response_start_index = len(tokens) - response_length
+            prompt_byte_length = (
+                student_token_spans[response_start_index][0] if response_length > 0 else len(full_text.encode("utf-8"))
+            )
+
+            teacher_full_ids = encode_text(self.opd_teacher_tokenizer, full_text)
+            teacher_token_bytes, teacher_token_spans = build_token_byte_spans(
+                self.opd_teacher_tokenizer, full_text, teacher_full_ids
+            )
+            _teacher_response_bytes, teacher_response_indices = clip_token_bytes_by_region(
+                teacher_token_bytes,
+                teacher_token_spans,
+                start_byte=prompt_byte_length,
+            )
+
+            teacher_tokens.append(teacher_full_ids)
+            teacher_response_lengths.append(len(teacher_response_indices))
+            teacher_loss_masks.append([1] * len(teacher_response_indices))
+
+        teacher_rollout_data = {
+            "tokens": teacher_tokens,
+            "response_lengths": teacher_response_lengths,
+            "loss_masks": teacher_loss_masks,
+            "total_lengths": [len(tokens) for tokens in teacher_tokens],
+        }
+        return self._prepare_rollout_data(teacher_rollout_data)
 
     def fill_routing_replay(self, data_iterator, num_microbatches, rollout_data):
         if "rollout_routed_experts" not in rollout_data:
@@ -429,10 +493,16 @@ class MegatronTrainRayActor(TrainRayActor):
                     if self.args.use_routing_replay:
                         os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
                     self._switch_model("teacher")
+                    teacher_rollout_data = rollout_data
+                    teacher_data_iterator = data_iterator
+                    teacher_num_microbatches = num_microbatches
+                    if getattr(self.args, "opd_alignment", "token") == "byte_chunk":
+                        teacher_rollout_data = self._build_cross_tokenizer_teacher_rollout_data(rollout_data)
+                        teacher_data_iterator, teacher_num_microbatches = get_data_iterator(self.args, self.model, teacher_rollout_data)
                     rollout_data.update(
                         self.compute_log_prob(
-                            data_iterator,
-                            num_microbatches,
+                            teacher_data_iterator,
+                            teacher_num_microbatches,
                             store_prefix="teacher_",
                         )
                     )

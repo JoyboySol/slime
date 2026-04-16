@@ -40,6 +40,30 @@ class Qwen3NextBridge(Qwen2MoEBridge):
         }
     )
 
+    _MLP_MAPPING = {
+        "mlp.linear_fc1.weight": [
+            "model.layers.{layer_number}.mlp.gate_proj.weight",
+            "model.layers.{layer_number}.mlp.up_proj.weight",
+        ],
+        "mlp.linear_fc1.layer_norm_weight": ["model.layers.{layer_number}.post_attention_layernorm.weight"],
+        "mlp.linear_fc2.weight": ["model.layers.{layer_number}.mlp.down_proj.weight"],
+        "shared_experts.linear_fc1.weight": [
+            "model.layers.{layer_number}.mlp.shared_expert.gate_proj.weight",
+            "model.layers.{layer_number}.mlp.shared_expert.up_proj.weight",
+        ],
+        "pre_mlp_layernorm": ["model.layers.{layer_number}.post_attention_layernorm.weight"],
+        "shared_experts.linear_fc2.weight": [
+            "model.layers.{layer_number}.mlp.shared_expert.down_proj.weight"
+        ],
+        "mlp.router.weight": ["model.layers.{layer_number}.mlp.gate.weight"],
+        "shared_experts.gate_weight": ["model.layers.{layer_number}.mlp.shared_expert_gate.weight"],
+        "mlp.experts.linear_fc1": [
+            "model.layers.{layer_number}.mlp.experts.{expert_id}.gate_proj.weight",
+            "model.layers.{layer_number}.mlp.experts.{expert_id}.up_proj.weight",
+        ],
+        "mlp.experts.linear_fc2": ["model.layers.{layer_number}.mlp.experts.{expert_id}.down_proj.weight"],
+    }
+
     def _get_gptmodel_args(self) -> dict:
         """Override to add MTP block spec if needed."""
         ret = super()._get_gptmodel_args()
@@ -54,6 +78,23 @@ class Qwen3NextBridge(Qwen2MoEBridge):
         if "mtp" in mcore_weights_name:
             return self._convert_mtp_param(mcore_weights_name)
         return super()._weight_name_mapping_mcore_to_hf(mcore_weights_name)
+
+    def _weight_name_mapping_mlp(self, name: str) -> list[str]:
+        layer_number = name.split(".")[2]
+        convert_names = []
+        for keyword, mapping_names in self._MLP_MAPPING.items():
+            if keyword in name:
+                if "{expert_id}" in mapping_names[0]:
+                    expert_id = name.split("weight")[-1]
+                    convert_names.extend(
+                        [mapped_name.format(layer_number=layer_number, expert_id=expert_id) for mapped_name in mapping_names]
+                    )
+                else:
+                    convert_names.extend([mapped_name.format(layer_number=layer_number) for mapped_name in mapping_names])
+                break
+        if len(convert_names) == 0:
+            raise NotImplementedError(f"Unsupported parameter name: {name}")
+        return convert_names
 
     def _convert_mtp_param(self, name: str) -> list[str]:
         """Convert MTP layer parameters from MCore to HF format."""
@@ -99,30 +140,35 @@ class Qwen3NextBridge(Qwen2MoEBridge):
         if "self_attention.linear_qkv." in mcore_weights_name and "layer_norm" not in mcore_weights_name:
             # merge qkv
             assert len(hf_weights) == 3
-            num_key_value_heads = self.hf_config.num_key_value_heads
             hidden_dim = self.hf_config.hidden_size
             num_attention_heads = self.hf_config.num_attention_heads
             num_querys_per_group = num_attention_heads // self.hf_config.num_key_value_heads
             head_dim = getattr(self.hf_config, "head_dim", hidden_dim // num_attention_heads)
-            group_dim = head_dim * num_attention_heads // num_key_value_heads
             q, k, v = hf_weights
-            # q k v might be tp split
-            real_num_key_value_heads = q.shape[0] // (2 * group_dim)
-            q = (
-                q.view(
-                    [
-                        real_num_key_value_heads,
-                        num_querys_per_group,
-                        2,
-                        head_dim,
-                        -1,
-                    ]
+
+            real_num_key_value_heads = k.shape[0] // head_dim
+            if real_num_key_value_heads == 0:
+                raise ValueError(f"Invalid k_proj shape for qkv packing: {k.shape}")
+
+            standard_q_rows = real_num_key_value_heads * num_querys_per_group * head_dim
+            gated_q_rows = real_num_key_value_heads * 2 * num_querys_per_group * head_dim
+
+            if q.shape[0] == standard_q_rows:
+                q = q.view(real_num_key_value_heads, num_querys_per_group, head_dim, -1)
+            elif q.shape[0] == gated_q_rows:
+                q = (
+                    q.view(real_num_key_value_heads, num_querys_per_group, 2, head_dim, -1)
+                    .transpose(1, 2)
+                    .reshape(real_num_key_value_heads, 2 * num_querys_per_group, head_dim, -1)
                 )
-                .transpose(1, 2)
-                .flatten(1, 3)
-            )
-            k = k.view([real_num_key_value_heads, head_dim, -1])
-            v = v.view([real_num_key_value_heads, head_dim, -1])
+            else:
+                raise ValueError(
+                    "Unexpected q_proj shape for qkv packing: "
+                    f"q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}"
+                )
+
+            k = k.view(real_num_key_value_heads, 1, head_dim, -1)
+            v = v.view(real_num_key_value_heads, 1, head_dim, -1)
             out_shape = [-1, hidden_dim] if ".bias" not in mcore_weights_name else [-1]
 
             qgkv = torch.cat([q, k, v], dim=1).view(*out_shape).contiguous()
@@ -147,27 +193,31 @@ class Qwen3NextBridge(Qwen2MoEBridge):
         if hasattr(self.hf_config, "num_nextn_predict_layers"):
             mtp_args["mtp_num_layers"] = self.hf_config.num_nextn_predict_layers
 
-        return self._build_base_config(
+        base_kwargs = dict(
             use_cpu_initialization=False,
-            # MoE specific
-            moe_ffn_hidden_size=self.hf_config.moe_intermediate_size,
-            moe_router_bias_update_rate=0.001,
-            moe_router_topk=self.hf_config.num_experts_per_tok,
-            num_moe_experts=self.hf_config.num_experts,
-            moe_aux_loss_coeff=self.hf_config.router_aux_loss_coef,
-            # moe_router_load_balancing_type="aux_loss",
-            moe_router_load_balancing_type="none",  # default None for RL
-            moe_grouped_gemm=True,
-            moe_router_score_function="softmax",
             # Other optimizations
             persist_layer_norm=True,
             bias_activation_fusion=True,
             bias_dropout_fusion=True,
             # Qwen specific
             moe_router_pre_softmax=False,
-            qk_layernorm=True,
+            qk_layernorm=getattr(self.hf_config, "enable_qk_norm", True),
             # Qwen3 Next specific
-            attention_output_gate=True,
-            moe_shared_expert_gate=True,
+            attention_output_gate=getattr(self.hf_config, "attn_output_gate", True),
             **mtp_args,
         )
+
+        if getattr(self.hf_config, "num_experts", 0):
+            base_kwargs.update(
+                moe_ffn_hidden_size=self.hf_config.moe_intermediate_size,
+                moe_router_bias_update_rate=0.001,
+                moe_router_topk=self.hf_config.num_experts_per_tok,
+                num_moe_experts=self.hf_config.num_experts,
+                moe_aux_loss_coeff=self.hf_config.router_aux_loss_coef,
+                moe_router_load_balancing_type="none",
+                moe_grouped_gemm=True,
+                moe_router_score_function=getattr(self.hf_config, "moe_router_score_function", "softmax"),
+                moe_shared_expert_gate=True,
+            )
+
+        return self._build_base_config(**base_kwargs)

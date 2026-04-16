@@ -751,6 +751,15 @@ class RolloutManager:
         if samples[0].teacher_log_probs is not None:
             train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
 
+        if any(sample.opd_prompt_text is not None for sample in samples):
+            train_data["opd_prompt_texts"] = [sample.opd_prompt_text for sample in samples]
+
+        if any(sample.opd_response_text is not None for sample in samples):
+            train_data["opd_response_texts"] = [sample.opd_response_text for sample in samples]
+
+        if any(sample.opd_full_text is not None for sample in samples):
+            train_data["opd_full_texts"] = [sample.opd_full_text for sample in samples]
+
         return train_data
 
     def set_train_parallel_config(self, config: dict):
@@ -790,6 +799,9 @@ class RolloutManager:
                 "rollout_routed_experts",
                 "prompt",
                 "teacher_log_probs",
+                "opd_prompt_texts",
+                "opd_response_texts",
+                "opd_full_texts",
             ]:
                 if key not in data:
                     continue

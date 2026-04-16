@@ -10,6 +10,7 @@ from torch.utils.checkpoint import checkpoint
 
 from slime.utils.distributed_utils import distributed_masked_whiten
 from slime.utils.misc import load_function
+from slime.utils.opd_utils import compute_byte_chunk_reverse_kl, decode_token_ids, get_cached_tokenizer
 from slime.utils.ppo_utils import (
     calculate_log_probs_and_entropy,
     compute_approx_kl,
@@ -558,10 +559,36 @@ def apply_opd_kl_to_advantages(
 
     device = student_log_probs[0].device
     teacher_log_probs = [t.to(device=device) for t in teacher_log_probs]
+    response_lengths: list[int] = rollout_data.get("response_lengths")
+    tokens: list[torch.Tensor] = rollout_data.get("tokens")
+    response_texts: list[str] | None = rollout_data.get("opd_response_texts")
+    full_texts: list[str] | None = rollout_data.get("opd_full_texts")
 
     reverse_kls = []
+    if getattr(args, "opd_alignment", "token") == "byte_chunk":
+        student_tokenizer = get_cached_tokenizer(args.hf_checkpoint)
+        teacher_tokenizer = get_cached_tokenizer(args.opd_teacher_hf_checkpoint)
+
     for i, adv in enumerate(advantages):
-        reverse_kl = student_log_probs[i] - teacher_log_probs[i]
+        if getattr(args, "opd_alignment", "token") == "byte_chunk":
+            full_token_ids = tokens[i].tolist()
+            full_text = (
+                full_texts[i]
+                if full_texts is not None and full_texts[i] is not None
+                else decode_token_ids(student_tokenizer, full_token_ids)
+            )
+            reverse_kl = compute_byte_chunk_reverse_kl(
+                full_text=full_text,
+                prompt_token_count=len(full_token_ids) - response_lengths[i],
+                student_token_ids=full_token_ids,
+                response_token_count=response_lengths[i],
+                student_log_probs=student_log_probs[i],
+                teacher_log_probs=teacher_log_probs[i],
+                student_tokenizer=student_tokenizer,
+                teacher_tokenizer=teacher_tokenizer,
+            ).to(device=device)
+        else:
+            reverse_kl = student_log_probs[i] - teacher_log_probs[i]
         advantages[i] = adv - args.opd_kl_coef * reverse_kl
         reverse_kls.append(reverse_kl)
 

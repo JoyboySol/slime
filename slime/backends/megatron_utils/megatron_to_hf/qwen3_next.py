@@ -3,6 +3,44 @@ import re
 import torch
 
 
+def _split_linear_qkv_weight(args, param):
+    try:
+        head_dim = args.kv_channels if args.kv_channels is not None else args.hidden_size // args.num_attention_heads
+    except AttributeError:
+        head_dim = args.hidden_size // args.num_attention_heads
+    value_num_per_group = args.num_attention_heads // args.num_query_groups
+    packed = param.view(args.num_query_groups, -1, head_dim, args.hidden_size)
+    packed_qkv_dim = packed.shape[1]
+
+    # Hybrid GDN checkpoints use the standard GQA-packed layout [Q, K, V].
+    standard_qkv_dim = value_num_per_group + 2
+    if packed_qkv_dim == standard_qkv_dim:
+        q_param, k_param, v_param = torch.split(
+            packed, split_size_or_sections=[value_num_per_group, 1, 1], dim=1
+        )
+        q_param = q_param.reshape(-1, args.hidden_size)
+        return q_param, k_param.reshape(-1, args.hidden_size), v_param.reshape(-1, args.hidden_size)
+
+    # Some Qwen3-Next checkpoints use the gated-attention layout where each
+    # query head contributes two packed slices.
+    gated_qkv_dim = 2 * value_num_per_group + 2
+    if packed_qkv_dim == gated_qkv_dim:
+        q_param, k_param, v_param = torch.split(
+            packed, split_size_or_sections=[2 * value_num_per_group, 1, 1], dim=1
+        )
+        q_param = (
+            q_param.reshape(args.num_query_groups, 2, value_num_per_group, head_dim, args.hidden_size)
+            .transpose(1, 2)
+            .reshape(-1, args.hidden_size)
+        )
+        return q_param, k_param.reshape(-1, args.hidden_size), v_param.reshape(-1, args.hidden_size)
+
+    raise ValueError(
+        "Unexpected qkv packed dimension "
+        f"{packed_qkv_dim} for {param.shape}, expected {standard_qkv_dim} or {gated_qkv_dim}"
+    )
+
+
 def _convert_mtp_layer(args, name, param, layer_idx):
     """Convert MTP layer parameters from Megatron to HuggingFace format.
 
@@ -115,17 +153,7 @@ def convert_qwen3_next_to_hf(args, name, param):
         if rest == "self_attention.linear_proj.weight":
             return [(f"model.layers.{layer_idx}.self_attn.o_proj.weight", param)]
         elif rest == "self_attention.linear_qkv.weight":
-            param = param.view(args.num_query_groups, -1, head_dim, args.hidden_size)
-            q_param, k_param, v_param = torch.split(
-                param, split_size_or_sections=[2 * value_num_per_group, 1, 1], dim=1
-            )
-            q_param = (
-                q_param.reshape(args.num_query_groups, 2, value_num_per_group, head_dim, args.hidden_size)
-                .transpose(1, 2)
-                .reshape(-1, args.hidden_size)
-            )
-            k_param = k_param.reshape(-1, args.hidden_size)
-            v_param = v_param.reshape(-1, args.hidden_size)
+            q_param, k_param, v_param = _split_linear_qkv_weight(args, param)
             return [
                 (f"model.layers.{layer_idx}.self_attn.q_proj.weight", q_param),
                 (f"model.layers.{layer_idx}.self_attn.k_proj.weight", k_param),

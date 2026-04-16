@@ -416,6 +416,9 @@ def log_rollout_data(
                 "rollout_routed_experts",
                 "max_seq_lens",
                 "dynamic_global_batch_size",
+                "opd_full_texts",
+                "opd_prompt_texts",
+                "opd_response_texts",
             ]:
                 continue
             # Upload per sample mean for each rollout value
@@ -425,6 +428,9 @@ def log_rollout_data(
                 if isinstance(val[0], torch.Tensor):
                     # NOTE: Here we have to do the clone().detach(), otherwise the tensor will be
                     # modified in place and will cause problem for the next rollout.
+                    if key == "teacher_log_probs" and getattr(args, "opd_alignment", "token") == "byte_chunk":
+                        sample_means = [x.float().mean() for x in val]
+                        val = torch.stack(sample_means).mean()
                     if key in [
                         "log_probs",
                         "ref_log_probs",
@@ -435,15 +441,16 @@ def log_rollout_data(
                         "teacher_log_probs",
                         "opd_reverse_kl",
                     ]:
-                        val = torch.cat(val).clone().detach()
-                        sum_of_sample_mean = get_sum_of_sample_mean(
-                            total_lengths,
-                            response_lengths,
-                            loss_masks,
-                            qkv_format=args.qkv_format,
-                            max_seq_lens=max_seq_lens,
-                        )
-                        val = cp_size * sum_of_sample_mean(val) / len(loss_masks)
+                        if not (key == "teacher_log_probs" and getattr(args, "opd_alignment", "token") == "byte_chunk"):
+                            val = torch.cat(val).clone().detach()
+                            sum_of_sample_mean = get_sum_of_sample_mean(
+                                total_lengths,
+                                response_lengths,
+                                loss_masks,
+                                qkv_format=args.qkv_format,
+                                max_seq_lens=max_seq_lens,
+                            )
+                            val = cp_size * sum_of_sample_mean(val) / len(loss_masks)
                     else:
                         val = torch.cat(val).clone().detach()
                         val = val.mean() * cp_size
