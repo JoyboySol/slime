@@ -774,6 +774,12 @@ class RolloutManager:
         if any(sample.opd_full_text is not None for sample in samples):
             train_data["opd_full_texts"] = [sample.opd_full_text for sample in samples]
 
+        if any(sample.opd_student_response_bytes is not None for sample in samples):
+            train_data["opd_student_response_bytes_list"] = [sample.opd_student_response_bytes for sample in samples]
+
+        if any(sample.opd_student_token_byte_spans is not None for sample in samples):
+            train_data["opd_student_token_byte_spans_list"] = [sample.opd_student_token_byte_spans for sample in samples]
+
         return train_data
 
     def set_train_parallel_config(self, config: dict):
@@ -816,6 +822,8 @@ class RolloutManager:
                 "opd_prompt_texts",
                 "opd_response_texts",
                 "opd_full_texts",
+                "opd_student_response_bytes_list",
+                "opd_student_token_byte_spans_list",
             ]:
                 if key not in data:
                     continue

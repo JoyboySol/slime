@@ -33,6 +33,8 @@ def _get_byte_chunk_log_prob_metrics(args: Namespace, rollout_data: RolloutBatch
     tokens = rollout_data.get("tokens")
     response_lengths = rollout_data.get("response_lengths")
     prompt_texts: list[str] | None = rollout_data.get("opd_prompt_texts")
+    student_response_bytes_list = rollout_data.get("opd_student_response_bytes_list")
+    student_token_byte_spans_list = rollout_data.get("opd_student_token_byte_spans_list")
 
     if not rollout_log_probs or not teacher_log_probs or not tokens or not response_lengths:
         return {}
@@ -61,6 +63,12 @@ def _get_byte_chunk_log_prob_metrics(args: Namespace, rollout_data: RolloutBatch
             teacher_log_probs=teacher_log_probs[i],
             student_tokenizer=student_tokenizer,
             teacher_tokenizer=teacher_tokenizer,
+            recorded_student_response_bytes=(
+                student_response_bytes_list[i] if student_response_bytes_list is not None else None
+            ),
+            recorded_student_token_byte_spans=(
+                student_token_byte_spans_list[i] if student_token_byte_spans_list is not None else None
+            ),
             allow_sequence_fallback=allow_sequence_fallback,
         )
         rollout_chunk_sample_means.append(student_chunk_log_probs.float().mean())

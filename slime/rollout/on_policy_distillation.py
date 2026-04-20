@@ -4,6 +4,7 @@ import torch
 
 from slime.utils.processing_utils import encode_image_for_rollout_engine
 from slime.utils.opd_utils import (
+    build_recorded_student_response_alignment,
     build_token_byte_spans,
     clip_token_bytes_by_region,
     decode_token_ids,
@@ -175,6 +176,37 @@ def _align_teacher_reward_log_probs(
     return _sequence_fallback("unalignable_reward_ids")
 
 
+def _record_student_opd_alignment(sample: Sample, student_tokenizer) -> None:
+    if sample.response_length <= 0:
+        sample.opd_student_response_bytes = []
+        sample.opd_student_token_byte_spans = []
+        sample.opd_student_alignment_version = 1
+        sample.opd_student_alignment_error = None
+        return
+
+    if sample.opd_response_text is None:
+        raise ValueError("Canonical OPD response text must be set before recording student alignment.")
+
+    try:
+        response_bytes, response_spans = build_recorded_student_response_alignment(
+            student_tokenizer,
+            full_token_ids=sample.tokens,
+            prompt_token_count=len(sample.tokens) - sample.response_length,
+            prompt_text=sample.opd_prompt_text or "",
+            response_text=sample.opd_response_text,
+            full_text=sample.opd_full_text,
+        )
+        sample.opd_student_response_bytes = list(response_bytes)
+        sample.opd_student_token_byte_spans = [list(span) for span in response_spans]
+        sample.opd_student_alignment_version = 1
+        sample.opd_student_alignment_error = None
+    except Exception as exc:
+        sample.opd_student_response_bytes = None
+        sample.opd_student_token_byte_spans = None
+        sample.opd_student_alignment_version = 1
+        sample.opd_student_alignment_error = str(exc)
+
+
 def compute_teacher_log_probs_for_sample(args, sample: Sample) -> torch.Tensor:
     """Extract teacher log-probs for one sample using the same path as training.
 
@@ -227,6 +259,7 @@ async def reward_func(args, sample, **kwargs):
             student_tokenizer=student_tokenizer,
             prompt_token_ids=prompt_token_ids,
         )
+        _record_student_opd_alignment(sample, student_tokenizer)
         payload["text"] = sample.opd_full_text
     else:
         payload["input_ids"] = sample.tokens

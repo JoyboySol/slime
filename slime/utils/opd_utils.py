@@ -29,6 +29,14 @@ def encode_text(tokenizer, text: str) -> list[int]:
     return tokenizer.encode(text, add_special_tokens=False)
 
 
+def _coerce_bytes(value: bytes | bytearray | list[int] | tuple[int, ...]) -> bytes:
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, bytearray):
+        return bytes(value)
+    return bytes(value)
+
+
 def _build_char_to_byte_offsets(text: str) -> list[int]:
     offsets = [0]
     total = 0
@@ -248,6 +256,85 @@ def build_contextual_suffix_token_bytes(
     return clipped_bytes, clipped_spans
 
 
+def validate_recorded_student_response_alignment(
+    *,
+    response_text: str,
+    response_token_count: int,
+    response_bytes: bytes | bytearray | list[int] | tuple[int, ...],
+    token_byte_spans: list[tuple[int, int]] | list[list[int]],
+) -> tuple[list[bytes], list[tuple[int, int]]]:
+    canonical_response_bytes = response_text.encode("utf-8")
+    normalized_response_bytes = _coerce_bytes(response_bytes)
+    if normalized_response_bytes != canonical_response_bytes:
+        raise ValueError("Recorded student response bytes do not match canonical response text.")
+
+    if len(token_byte_spans) != response_token_count:
+        raise ValueError("Recorded student response span count does not match response token count.")
+
+    token_bytes: list[bytes] = []
+    normalized_spans: list[tuple[int, int]] = []
+    cursor = 0
+    for raw_start, raw_end in token_byte_spans:
+        start = int(raw_start)
+        end = int(raw_end)
+        if start != cursor or end < start:
+            raise ValueError("Recorded student response spans must be monotonic and gap-free.")
+        if end > len(normalized_response_bytes):
+            raise ValueError("Recorded student response span exceeds response byte length.")
+        token_bytes.append(normalized_response_bytes[start:end])
+        normalized_spans.append((start, end))
+        cursor = end
+
+    if cursor != len(normalized_response_bytes):
+        raise ValueError("Recorded student response spans do not cover the full response bytes.")
+
+    return token_bytes, normalized_spans
+
+
+def build_recorded_student_response_alignment(
+    tokenizer,
+    *,
+    full_token_ids: list[int],
+    prompt_token_count: int,
+    prompt_text: str,
+    response_text: str | None = None,
+    full_text: str | None = None,
+) -> tuple[bytes, list[tuple[int, int]]]:
+    response_token_ids = full_token_ids[prompt_token_count:]
+    if response_text is None:
+        if full_text is not None and full_text.startswith(prompt_text):
+            response_text = full_text[len(prompt_text) :]
+        else:
+            response_text = decode_token_ids(tokenizer, response_token_ids)
+    canonical_response_bytes = response_text.encode("utf-8")
+
+    if full_text is None:
+        full_text = f"{prompt_text}{response_text}"
+
+    try:
+        token_bytes, token_byte_spans = build_contextual_suffix_token_bytes(
+            tokenizer,
+            full_token_ids,
+            prompt_token_count,
+            prompt_text,
+            full_text=full_text,
+        )
+        if b"".join(token_bytes) == canonical_response_bytes:
+            return canonical_response_bytes, token_byte_spans
+    except Exception:
+        pass
+
+    try:
+        token_bytes, token_byte_spans = _build_token_byte_spans_via_token_strings(tokenizer, response_text, response_token_ids)
+        if b"".join(token_bytes) == canonical_response_bytes:
+            return canonical_response_bytes, token_byte_spans
+    except Exception:
+        pass
+
+    token_bytes, token_byte_spans = build_token_byte_spans_strict(tokenizer, response_text, response_token_ids)
+    return canonical_response_bytes, token_byte_spans
+
+
 def compute_byte_chunk_reverse_kl(
     *,
     full_text: str,
@@ -259,6 +346,8 @@ def compute_byte_chunk_reverse_kl(
     teacher_log_probs: torch.Tensor,
     student_tokenizer,
     teacher_tokenizer,
+    recorded_student_response_bytes: bytes | bytearray | list[int] | tuple[int, ...] | None = None,
+    recorded_student_token_byte_spans: list[tuple[int, int]] | list[list[int]] | None = None,
     allow_sequence_fallback: bool = True,
 ) -> torch.Tensor:
     student_chunk_log_probs, teacher_chunk_log_probs = compute_byte_chunk_aligned_log_probs(
@@ -271,6 +360,8 @@ def compute_byte_chunk_reverse_kl(
         teacher_log_probs=teacher_log_probs,
         student_tokenizer=student_tokenizer,
         teacher_tokenizer=teacher_tokenizer,
+        recorded_student_response_bytes=recorded_student_response_bytes,
+        recorded_student_token_byte_spans=recorded_student_token_byte_spans,
         allow_sequence_fallback=allow_sequence_fallback,
     )
     return student_chunk_log_probs - teacher_chunk_log_probs
@@ -287,6 +378,8 @@ def compute_byte_chunk_aligned_log_probs(
     teacher_log_probs: torch.Tensor,
     student_tokenizer,
     teacher_tokenizer,
+    recorded_student_response_bytes: bytes | bytearray | list[int] | tuple[int, ...] | None = None,
+    recorded_student_token_byte_spans: list[tuple[int, int]] | list[list[int]] | None = None,
     allow_sequence_fallback: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if len(student_token_ids) != prompt_token_count + response_token_count:
@@ -301,7 +394,10 @@ def compute_byte_chunk_aligned_log_probs(
     response_token_ids = student_token_ids[prompt_token_count:]
     if prompt_text is None:
         prompt_text = decode_token_ids(student_tokenizer, prompt_token_ids)
-    response_text = decode_token_ids(student_tokenizer, response_token_ids)
+    if full_text.startswith(prompt_text):
+        response_text = full_text[len(prompt_text) :]
+    else:
+        response_text = decode_token_ids(student_tokenizer, response_token_ids)
     prompt_byte_length = len(prompt_text.encode("utf-8"))
 
     def _preview(tokenizer, token_ids, token_bytes):
@@ -345,17 +441,30 @@ def compute_byte_chunk_aligned_log_probs(
             torch.full_like(student_log_probs, teacher_sequence_log_prob.item()),
         )
 
-    try:
-        student_response_bytes, _student_response_spans = build_contextual_suffix_token_bytes(
-            student_tokenizer, student_token_ids, prompt_token_count, prompt_text
-        )
-    except ValueError:
+    if recorded_student_response_bytes is not None or recorded_student_token_byte_spans is not None:
+        if recorded_student_response_bytes is None or recorded_student_token_byte_spans is None:
+            return _sequence_fallback("student_recorded_alignment_incomplete")
         try:
-            student_response_bytes, _student_response_spans = build_token_byte_spans(
-                student_tokenizer, response_text, response_token_ids
+            student_response_bytes, _student_response_spans = validate_recorded_student_response_alignment(
+                response_text=response_text,
+                response_token_count=response_token_count,
+                response_bytes=recorded_student_response_bytes,
+                token_byte_spans=recorded_student_token_byte_spans,
             )
         except ValueError as exc:
-            return _sequence_fallback(f"student_byte_reconstruction_failed: {exc}")
+            return _sequence_fallback(f"student_recorded_alignment_failed: {exc}")
+    else:
+        try:
+            student_response_bytes, _student_response_spans = build_contextual_suffix_token_bytes(
+                student_tokenizer, student_token_ids, prompt_token_count, prompt_text
+            )
+        except ValueError:
+            try:
+                student_response_bytes, _student_response_spans = build_token_byte_spans(
+                    student_tokenizer, response_text, response_token_ids
+                )
+            except ValueError as exc:
+                return _sequence_fallback(f"student_byte_reconstruction_failed: {exc}")
 
     teacher_token_ids = encode_text(teacher_tokenizer, full_text)
     try:

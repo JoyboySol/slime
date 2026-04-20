@@ -564,6 +564,8 @@ def apply_opd_kl_to_advantages(
     prompt_texts: list[str] | None = rollout_data.get("opd_prompt_texts")
     response_texts: list[str] | None = rollout_data.get("opd_response_texts")
     full_texts: list[str] | None = rollout_data.get("opd_full_texts")
+    student_response_bytes_list = rollout_data.get("opd_student_response_bytes_list")
+    student_token_byte_spans_list = rollout_data.get("opd_student_token_byte_spans_list")
 
     reverse_kls = []
     if getattr(args, "opd_alignment", "token") == "byte_chunk":
@@ -589,6 +591,12 @@ def apply_opd_kl_to_advantages(
                 teacher_log_probs=teacher_log_probs[i],
                 student_tokenizer=student_tokenizer,
                 teacher_tokenizer=teacher_tokenizer,
+                recorded_student_response_bytes=(
+                    student_response_bytes_list[i] if student_response_bytes_list is not None else None
+                ),
+                recorded_student_token_byte_spans=(
+                    student_token_byte_spans_list[i] if student_token_byte_spans_list is not None else None
+                ),
                 allow_sequence_fallback=allow_sequence_fallback,
             ).to(device=device)
         else:

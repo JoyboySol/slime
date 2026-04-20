@@ -6,7 +6,11 @@ import types
 import pytest
 import torch
 
-from slime.rollout.on_policy_distillation import compute_teacher_log_probs_for_sample, post_process_rewards
+from slime.rollout.on_policy_distillation import (
+    _record_student_opd_alignment,
+    compute_teacher_log_probs_for_sample,
+    post_process_rewards,
+)
 from slime.utils.types import Sample
 from slime.utils import opd_utils
 from slime.utils.opd_utils import build_contextual_suffix_token_bytes
@@ -169,6 +173,48 @@ def test_build_token_byte_spans_falls_back_to_token_strings_when_prefix_decode_i
     assert b"".join(token_bytes) == "你好".encode("utf-8")
     assert token_bytes == ["你".encode("utf-8"), "好".encode("utf-8")]
     assert token_spans == [(0, 3), (3, 6)]
+
+
+def test_validate_recorded_student_response_alignment_accepts_valid_payload():
+    token_bytes, token_spans = opd_utils.validate_recorded_student_response_alignment(
+        response_text="AB",
+        response_token_count=2,
+        response_bytes="AB".encode("utf-8"),
+        token_byte_spans=[(0, 1), (1, 2)],
+    )
+
+    assert token_bytes == [b"A", b"B"]
+    assert token_spans == [(0, 1), (1, 2)]
+
+
+def test_validate_recorded_student_response_alignment_rejects_wrong_span_count():
+    with pytest.raises(ValueError, match="span count"):
+        opd_utils.validate_recorded_student_response_alignment(
+            response_text="AB",
+            response_token_count=2,
+            response_bytes="AB".encode("utf-8"),
+            token_byte_spans=[(0, 2)],
+        )
+
+
+def test_validate_recorded_student_response_alignment_rejects_non_monotonic_spans():
+    with pytest.raises(ValueError, match="monotonic"):
+        opd_utils.validate_recorded_student_response_alignment(
+            response_text="AB",
+            response_token_count=2,
+            response_bytes="AB".encode("utf-8"),
+            token_byte_spans=[(0, 1), (0, 2)],
+        )
+
+
+def test_validate_recorded_student_response_alignment_rejects_byte_mismatch():
+    with pytest.raises(ValueError, match="canonical response text"):
+        opd_utils.validate_recorded_student_response_alignment(
+            response_text="AB",
+            response_token_count=2,
+            response_bytes="AX".encode("utf-8"),
+            token_byte_spans=[(0, 1), (1, 2)],
+        )
 
 
 def test_compute_byte_chunk_reverse_kl_many_teacher_tokens_to_one_student_token():
@@ -982,6 +1028,67 @@ def test_compute_byte_chunk_reverse_kl_raises_when_sequence_fallback_disabled_on
         )
 
 
+def test_compute_byte_chunk_aligned_log_probs_prefers_recorded_student_alignment(monkeypatch):
+    student_tokenizer = BoundaryAwareTokenizer(
+        token_map={1: "P", 2: "A", 3: "X"},
+        encode_map={"PAB": [1, 2, 3]},
+        decode_map={
+            (1,): "P",
+            (1, 2): "PX",
+            (1, 2, 3): "PAB",
+            (2,): "A",
+            (2, 3): "XB",
+        },
+        offsets_map={"PAB": [(0, 1), (0, 1), (0, 1)]},
+    )
+    teacher_tokenizer = FakeTokenizer({10: "P", 11: "AB"})
+    student_tokenizer.convert_ids_to_tokens = None
+
+    def fail_build_contextual(*args, **kwargs):
+        raise AssertionError("legacy student reconstruction path should not be used")
+
+    monkeypatch.setattr("slime.utils.opd_utils.build_contextual_suffix_token_bytes", fail_build_contextual)
+
+    student_chunk_log_probs, teacher_chunk_log_probs = opd_utils.compute_byte_chunk_aligned_log_probs(
+        full_text="PAB",
+        prompt_text="P",
+        prompt_token_count=1,
+        student_token_ids=[1, 2, 3],
+        response_token_count=2,
+        student_log_probs=torch.tensor([-0.2, -0.3]),
+        teacher_log_probs=torch.tensor([-0.4]),
+        student_tokenizer=student_tokenizer,
+        teacher_tokenizer=teacher_tokenizer,
+        recorded_student_response_bytes="AB".encode("utf-8"),
+        recorded_student_token_byte_spans=[(0, 1), (1, 2)],
+        allow_sequence_fallback=False,
+    )
+
+    assert torch.allclose(student_chunk_log_probs, torch.tensor([-0.25, -0.25]))
+    assert torch.allclose(teacher_chunk_log_probs, torch.tensor([-0.2, -0.2]))
+
+
+def test_record_student_opd_alignment_stores_response_bytes_and_spans():
+    sample = Sample(
+        tokens=[1, 2, 3],
+        response_length=2,
+        opd_prompt_text="P",
+        opd_response_text="AB",
+        opd_full_text="PAB",
+    )
+    student_tokenizer = BoundaryAwareTokenizer(
+        token_map={1: "P", 2: "A", 3: "B"},
+        encode_map={"PAB": [1, 2, 3], "AB": [2, 3]},
+    )
+
+    _record_student_opd_alignment(sample, student_tokenizer)
+
+    assert sample.opd_student_response_bytes == [65, 66]
+    assert sample.opd_student_token_byte_spans == [[0, 1], [1, 2]]
+    assert sample.opd_student_alignment_version == 1
+    assert sample.opd_student_alignment_error is None
+
+
 def test_apply_opd_byte_chunk_to_advantages(monkeypatch):
     megatron = types.ModuleType("megatron")
     megatron_core = types.ModuleType("megatron.core")
@@ -1032,3 +1139,75 @@ def test_apply_opd_byte_chunk_to_advantages(monkeypatch):
 
     assert torch.allclose(advantages[0], torch.tensor([0.9, 0.9, 0.6]))
     assert torch.allclose(rollout_data["opd_reverse_kl"][0], torch.tensor([0.05, 0.05, 0.2]))
+
+
+def test_apply_opd_byte_chunk_to_advantages_prefers_recorded_student_alignment(monkeypatch):
+    megatron = types.ModuleType("megatron")
+    megatron_core = types.ModuleType("megatron.core")
+    megatron_mpu = types.SimpleNamespace(
+        is_pipeline_last_stage=lambda: True,
+        get_context_parallel_world_size=lambda: 1,
+        get_context_parallel_rank=lambda: 0,
+        get_context_parallel_group=lambda: None,
+        get_tensor_model_parallel_group=lambda: None,
+    )
+    megatron.core = megatron_core
+    megatron_core.mpu = megatron_mpu
+    sys.modules.setdefault("megatron", megatron)
+    sys.modules.setdefault("megatron.core", megatron_core)
+    sys.modules.setdefault("megatron.core.mpu", megatron_mpu)
+
+    from slime.backends.megatron_utils.loss import apply_opd_kl_to_advantages
+
+    student_tokenizer = BoundaryAwareTokenizer(
+        token_map={1: "P", 2: "A", 3: "X"},
+        encode_map={"PAB": [1, 2, 3]},
+        decode_map={
+            (1,): "P",
+            (1, 2): "PX",
+            (1, 2, 3): "PAB",
+            (2,): "A",
+            (2, 3): "XB",
+        },
+        offsets_map={"PAB": [(0, 1), (0, 1), (0, 1)]},
+    )
+    teacher_tokenizer = FakeTokenizer({10: "P", 11: "AB"})
+    student_tokenizer.convert_ids_to_tokens = None
+
+    def fake_get_cached_tokenizer(path):
+        if path == "student":
+            return student_tokenizer
+        if path == "teacher":
+            return teacher_tokenizer
+        raise AssertionError(f"Unexpected tokenizer path: {path}")
+
+    monkeypatch.setattr("slime.backends.megatron_utils.loss.get_cached_tokenizer", fake_get_cached_tokenizer)
+
+    def fail_build_contextual(*args, **kwargs):
+        raise AssertionError("legacy student reconstruction path should not be used")
+
+    monkeypatch.setattr("slime.utils.opd_utils.build_contextual_suffix_token_bytes", fail_build_contextual)
+
+    args = Namespace(
+        opd_type="sglang",
+        opd_kl_coef=2.0,
+        opd_alignment="byte_chunk",
+        hf_checkpoint="student",
+        opd_teacher_hf_checkpoint="teacher",
+    )
+    rollout_data = {
+        "tokens": [torch.tensor([1, 2, 3])],
+        "response_lengths": [2],
+        "teacher_log_probs": [torch.tensor([-0.4])],
+        "opd_full_texts": ["PAB"],
+        "opd_prompt_texts": ["P"],
+        "opd_student_response_bytes_list": [[65, 66]],
+        "opd_student_token_byte_spans_list": [[[0, 1], [1, 2]]],
+    }
+    advantages = [torch.tensor([1.0, 1.0])]
+    student_log_probs = [torch.tensor([-0.2, -0.3])]
+
+    apply_opd_kl_to_advantages(args, rollout_data, advantages, student_log_probs)
+
+    assert torch.allclose(advantages[0], torch.tensor([1.1, 1.1]))
+    assert torch.allclose(rollout_data["opd_reverse_kl"][0], torch.tensor([-0.05, -0.05]))
