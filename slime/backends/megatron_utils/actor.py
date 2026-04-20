@@ -34,6 +34,7 @@ from .cp_utils import slice_log_prob_with_cp, slice_with_cp
 from .data import DataIterator, get_data_iterator, log_perf_data, log_rollout_data, sync_actor_critic_data
 from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
+from .model_name_utils import infer_update_weight_model_name
 from .model import forward_only, initialize_model_and_optimizer, save, train
 from .update_weight.common import named_params_and_buffers
 from .update_weight.update_weight_from_distributed import UpdateWeightFromDistributed
@@ -144,7 +145,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self.args,
             self.model,
             weights_getter=lambda: self.weights_backuper.get("actor"),
-            model_name=type(self.hf_config).__name__.lower() if self.args.model_name is None else self.args.model_name,
+            model_name=infer_update_weight_model_name(self.args, self.hf_config),
             quantization_config=getattr(self.hf_config, "quantization_config", None),
         )
 
@@ -293,6 +294,7 @@ class MegatronTrainRayActor(TrainRayActor):
         response_texts = rollout_data.get("opd_response_texts")
 
         for i, (tokens, response_length) in enumerate(zip(rollout_data["tokens"], rollout_data["response_lengths"], strict=False)):
+            prompt_token_count = len(tokens) - response_length
             if full_texts is not None:
                 full_text = full_texts[i]
             else:
@@ -301,11 +303,12 @@ class MegatronTrainRayActor(TrainRayActor):
                 else:
                     full_text = decode_token_ids(self.tokenizer, tokens.tolist())
 
-            student_token_bytes, student_token_spans = build_token_byte_spans(self.tokenizer, full_text, tokens.tolist())
-            response_start_index = len(tokens) - response_length
-            prompt_byte_length = (
-                student_token_spans[response_start_index][0] if response_length > 0 else len(full_text.encode("utf-8"))
+            prompt_text = (
+                prompt_texts[i]
+                if prompt_texts is not None
+                else decode_token_ids(self.tokenizer, tokens.tolist()[:prompt_token_count])
             )
+            prompt_byte_length = len(prompt_text.encode("utf-8"))
 
             teacher_full_ids = encode_text(self.opd_teacher_tokenizer, full_text)
             teacher_token_bytes, teacher_token_spans = build_token_byte_spans(

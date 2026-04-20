@@ -14,7 +14,8 @@ from .hf_attention import _load_hf_config
 try:
     from fla.modules import FusedRMSNormGated, ShortConvolution
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
-    from transformers.models.qwen3_next.modeling_qwen3_next import Qwen3NextAttention, Qwen3NextRMSNorm
+    from transformers.models.llama.modeling_llama import LlamaRMSNorm
+    from transformers.models.qwen3_next.modeling_qwen3_next import Qwen3NextAttention
 except ImportError:
     pass
 
@@ -184,7 +185,7 @@ class Attention(HuggingfaceAttention):
             raise ImportError("Please install transformers>=4.35.0 to use Qwen3NextAttention.")
 
         self.linear_attn = YuLanMiniGatedDeltaNet(self.hf_config, self.hf_layer_idx)
-        self.input_layernorm = Qwen3NextRMSNorm(self.hf_config.hidden_size, eps=self.hf_config.rms_norm_eps)
+        self.input_layernorm = LlamaRMSNorm(self.hf_config.hidden_size, eps=self.hf_config.rms_norm_eps)
 
     def hf_forward(self, hidden_states, packed_seq_params):
         hidden_states = self.input_layernorm(hidden_states)

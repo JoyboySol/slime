@@ -141,6 +141,44 @@ class YuLanMiniBridge(Qwen2MoEBridge):
     def _weight_to_mcore_format(
         self, mcore_weights_name: str, hf_weights: list[torch.Tensor]
     ) -> tuple[list[str], list[torch.Tensor]]:
+        if "self_attention.linear_qkv." in mcore_weights_name and "layer_norm" not in mcore_weights_name:
+            # YuLan Mini reuses the Qwen3-Next gated-q attention layout. When
+            # q_proj stores interleaved gated heads, we must reshape/reorder Q
+            # before concatenating QKV into Megatron's fused linear_qkv weight.
+            assert len(hf_weights) == 3
+            hidden_dim = self.hf_config.hidden_size
+            num_attention_heads = self.hf_config.num_attention_heads
+            num_querys_per_group = num_attention_heads // self.hf_config.num_key_value_heads
+            head_dim = getattr(self.hf_config, "head_dim", hidden_dim // num_attention_heads)
+            q, k, v = hf_weights
+
+            real_num_key_value_heads = k.shape[0] // head_dim
+            if real_num_key_value_heads == 0:
+                raise ValueError(f"Invalid k_proj shape for qkv packing: {k.shape}")
+
+            standard_q_rows = real_num_key_value_heads * num_querys_per_group * head_dim
+            gated_q_rows = real_num_key_value_heads * 2 * num_querys_per_group * head_dim
+
+            if q.shape[0] == standard_q_rows:
+                q = q.view(real_num_key_value_heads, num_querys_per_group, head_dim, -1)
+            elif q.shape[0] == gated_q_rows:
+                q = (
+                    q.view(real_num_key_value_heads, num_querys_per_group, 2, head_dim, -1)
+                    .transpose(1, 2)
+                    .reshape(real_num_key_value_heads, 2 * num_querys_per_group, head_dim, -1)
+                )
+            else:
+                raise ValueError(
+                    "Unexpected q_proj shape for qkv packing: "
+                    f"q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}"
+                )
+
+            k = k.view(real_num_key_value_heads, 1, head_dim, -1)
+            v = v.view(real_num_key_value_heads, 1, head_dim, -1)
+            out_shape = [-1, hidden_dim] if ".bias" not in mcore_weights_name else [-1]
+
+            return torch.cat([q, k, v], dim=1).view(*out_shape).contiguous()
+
         weight = super()._weight_to_mcore_format(mcore_weights_name, hf_weights)
         if mcore_weights_name.endswith("eh_proj.weight"):
             first_half, second_half = weight.chunk(2, dim=1)

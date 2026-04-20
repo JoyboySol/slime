@@ -40,6 +40,7 @@ SGLANG_CONTEXT_LENGTH="${SGLANG_CONTEXT_LENGTH:-2048}"
 TEACHER_MEM_FRACTION_STATIC="${TEACHER_MEM_FRACTION_STATIC:-0.55}"
 ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-1}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flash}"
+OPD_DISABLE_SEQUENCE_FALLBACK="${OPD_DISABLE_SEQUENCE_FALLBACK:-false}"
 
 mkdir -p "${WORK_DIR}" "${ACTOR_CKPT}"
 
@@ -189,6 +190,9 @@ OPD_ARGS=(
     --entropy-coef 0.0
     --eps-clip 0.2
 )
+if [[ "${OPD_DISABLE_SEQUENCE_FALLBACK}" == "true" ]]; then
+    OPD_ARGS+=(--opd-disable-sequence-fallback)
+fi
 
 PERF_ARGS=(
     --tensor-model-parallel-size 1

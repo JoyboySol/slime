@@ -13,7 +13,7 @@ if __name__ == "__main__":
     for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"]:
         os.environ.pop(key, None)
     os.environ["NO_PROXY"] = ",".join(filter(None, [os.environ.get("NO_PROXY"), "127.0.0.1", "localhost", os.environ.get("MASTER_ADDR", "")]))
-    num_gpus = int(os.environ.get("NUM_GPUS", "4"))
+    num_gpus = int(os.environ.get("RAY_NUM_GPUS", os.environ.get("NUM_GPUS", "4")))
     print(f"[driver] ray.init(local) begin num_gpus={num_gpus} dashboard_disabled=1", flush=True)
     ray.init(
         num_gpus=num_gpus,

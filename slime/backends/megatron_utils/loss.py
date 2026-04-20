@@ -561,6 +561,7 @@ def apply_opd_kl_to_advantages(
     teacher_log_probs = [t.to(device=device) for t in teacher_log_probs]
     response_lengths: list[int] = rollout_data.get("response_lengths")
     tokens: list[torch.Tensor] = rollout_data.get("tokens")
+    prompt_texts: list[str] | None = rollout_data.get("opd_prompt_texts")
     response_texts: list[str] | None = rollout_data.get("opd_response_texts")
     full_texts: list[str] | None = rollout_data.get("opd_full_texts")
 
@@ -568,6 +569,7 @@ def apply_opd_kl_to_advantages(
     if getattr(args, "opd_alignment", "token") == "byte_chunk":
         student_tokenizer = get_cached_tokenizer(args.hf_checkpoint)
         teacher_tokenizer = get_cached_tokenizer(args.opd_teacher_hf_checkpoint)
+        allow_sequence_fallback = not getattr(args, "opd_disable_sequence_fallback", False)
 
     for i, adv in enumerate(advantages):
         if getattr(args, "opd_alignment", "token") == "byte_chunk":
@@ -579,6 +581,7 @@ def apply_opd_kl_to_advantages(
             )
             reverse_kl = compute_byte_chunk_reverse_kl(
                 full_text=full_text,
+                prompt_text=prompt_texts[i] if prompt_texts is not None else None,
                 prompt_token_count=len(full_token_ids) - response_lengths[i],
                 student_token_ids=full_token_ids,
                 response_token_count=response_lengths[i],
@@ -586,6 +589,7 @@ def apply_opd_kl_to_advantages(
                 teacher_log_probs=teacher_log_probs[i],
                 student_tokenizer=student_tokenizer,
                 teacher_tokenizer=teacher_tokenizer,
+                allow_sequence_fallback=allow_sequence_fallback,
             ).to(device=device)
         else:
             reverse_kl = student_log_probs[i] - teacher_log_probs[i]

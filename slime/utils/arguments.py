@@ -10,6 +10,7 @@ from sglang_router.launch_router import RouterArgs
 from slime.backends.sglang_utils.arguments import sglang_parse_args
 from slime.backends.sglang_utils.arguments import validate_args as sglang_validate_args
 from slime.utils.eval_config import EvalDatasetConfig, build_eval_dataset_configs, ensure_dataset_list
+from slime.utils.load_path_utils import resolve_bridge_initial_load_path
 from slime.utils.logging_utils import configure_logger
 
 logger = logging.getLogger(__name__)
@@ -1018,6 +1019,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Required when --opd-alignment=byte_chunk."
                 ),
             )
+            parser.add_argument(
+                "--opd-disable-sequence-fallback",
+                action="store_true",
+                default=False,
+                help=(
+                    "Disable byte_chunk OPD sequence-level fallback. "
+                    "When enabled, any byte-span reconstruction/alignment failure will raise instead of "
+                    "falling back to sequence-level penalties."
+                ),
+            )
             return parser
 
         def add_router_arguments(parser):
@@ -1125,6 +1136,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Save the rollout data to this path for debugging. "
                     "The file will be saved to `save_debug_rollout_data.format(rollout_id)`."
+                ),
+            )
+            parser.add_argument(
+                "--save-debug-rollout-interval",
+                type=int,
+                default=None,
+                help=(
+                    "Save debug rollout data every N rollouts. "
+                    "If unset, falls back to eval_interval for backward compatibility."
                 ),
             )
             # --load-debug-rollout-data, --debug-rollout-only, --debug-train-only
@@ -1581,8 +1601,7 @@ def slime_validate_args(args):
             # If is a Megatron checkpoint, won't use bridge to load hf weight.
             pass
         else:
-            if args.load is None:
-                args.load = args.ref_load or args.hf_checkpoint
+            args.load = resolve_bridge_initial_load_path(args.load, args.ref_load, args.hf_checkpoint)
             # If is a HF checkpoint, set start_rollout_id to 0 here.
             args.start_rollout_id = 0
     else:

@@ -1,4 +1,5 @@
 import logging
+import os
 from argparse import Namespace
 from collections.abc import Sequence
 
@@ -13,6 +14,7 @@ from slime.utils import train_metric_utils
 from slime.utils.data import get_minimum_num_micro_batch_size
 from slime.utils.flops_utils import calculate_fwd_flops
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step
+from slime.utils.opd_utils import compute_byte_chunk_aligned_log_probs, decode_token_ids, get_cached_tokenizer
 from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from slime.utils.types import RolloutBatch
 
@@ -20,6 +22,54 @@ from ...utils import logging_utils
 from .cp_utils import get_sum_of_sample_mean, slice_with_cp
 
 logger = logging.getLogger(__name__)
+
+
+def _get_byte_chunk_log_prob_metrics(args: Namespace, rollout_data: RolloutBatch) -> dict[str, float]:
+    if getattr(args, "opd_alignment", "token") != "byte_chunk":
+        return {}
+
+    rollout_log_probs = rollout_data.get("rollout_log_probs")
+    teacher_log_probs = rollout_data.get("teacher_log_probs")
+    tokens = rollout_data.get("tokens")
+    response_lengths = rollout_data.get("response_lengths")
+    prompt_texts: list[str] | None = rollout_data.get("opd_prompt_texts")
+
+    if not rollout_log_probs or not teacher_log_probs or not tokens or not response_lengths:
+        return {}
+
+    student_tokenizer = get_cached_tokenizer(args.hf_checkpoint)
+    teacher_tokenizer = get_cached_tokenizer(args.opd_teacher_hf_checkpoint)
+    full_texts: list[str] | None = rollout_data.get("opd_full_texts")
+    allow_sequence_fallback = not getattr(args, "opd_disable_sequence_fallback", False)
+
+    rollout_chunk_sample_means = []
+    teacher_chunk_sample_means = []
+    for i, student_log_prob in enumerate(rollout_log_probs):
+        full_token_ids = tokens[i].tolist()
+        full_text = (
+            full_texts[i]
+            if full_texts is not None and full_texts[i] is not None
+            else decode_token_ids(student_tokenizer, full_token_ids)
+        )
+        student_chunk_log_probs, teacher_chunk_log_probs = compute_byte_chunk_aligned_log_probs(
+            full_text=full_text,
+            prompt_text=prompt_texts[i] if prompt_texts is not None else None,
+            prompt_token_count=len(full_token_ids) - response_lengths[i],
+            student_token_ids=full_token_ids,
+            response_token_count=response_lengths[i],
+            student_log_probs=student_log_prob,
+            teacher_log_probs=teacher_log_probs[i],
+            student_tokenizer=student_tokenizer,
+            teacher_tokenizer=teacher_tokenizer,
+            allow_sequence_fallback=allow_sequence_fallback,
+        )
+        rollout_chunk_sample_means.append(student_chunk_log_probs.float().mean())
+        teacher_chunk_sample_means.append(teacher_chunk_log_probs.float().mean())
+
+    return {
+        "rollout_chunk_log_prob": torch.stack(rollout_chunk_sample_means).mean().item(),
+        "teacher_chunk_log_prob": torch.stack(teacher_chunk_sample_means).mean().item(),
+    }
 
 
 def get_batch(
@@ -407,6 +457,32 @@ def log_rollout_data(
         total_lengths = rollout_data["total_lengths"]
         max_seq_lens = rollout_data.get("max_seq_lens", None)
 
+        if os.getenv("SLIME_DEBUG_LOGPROB_DUMP") == "1" and rollout_id == 0:
+            train_log_probs = rollout_data.get("log_probs")
+            rollout_log_probs = rollout_data.get("rollout_log_probs")
+            tokens = rollout_data.get("tokens")
+            if train_log_probs and rollout_log_probs and tokens:
+                sample_idx = 0
+                response_length = response_lengths[sample_idx]
+                prompt_length = total_lengths[sample_idx] - response_length
+                sample_tokens = tokens[sample_idx]
+                logger.warning(
+                    "DEBUG_LOGPROB sample=%s total=%s prompt=%s response=%s "
+                    "train_first8=%s rollout_first8=%s "
+                    "train_last8=%s rollout_last8=%s "
+                    "response_token_head=%s response_token_tail=%s",
+                    sample_idx,
+                    total_lengths[sample_idx],
+                    prompt_length,
+                    response_length,
+                    train_log_probs[sample_idx][:8].float().cpu().tolist(),
+                    rollout_log_probs[sample_idx][:8].float().cpu().tolist(),
+                    train_log_probs[sample_idx][-8:].float().cpu().tolist(),
+                    rollout_log_probs[sample_idx][-8:].float().cpu().tolist(),
+                    sample_tokens[prompt_length : prompt_length + 8].tolist(),
+                    sample_tokens[-8:].tolist(),
+                )
+
         for key, val in rollout_data.items():
             if key in [
                 "tokens",
@@ -461,6 +537,8 @@ def log_rollout_data(
             else:
                 raise ValueError(f"Unsupported type: {type(val)} for key: {key}")
             log_dict[key] = val.item() if isinstance(val, torch.Tensor) else val
+
+        log_dict.update(_get_byte_chunk_log_prob_metrics(args, rollout_data))
 
         reduced_log_dict = gather_log_data("rollout", args, rollout_id, log_dict)
         if args.ci_test and reduced_log_dict is not None:

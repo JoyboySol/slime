@@ -5,6 +5,7 @@ import multiprocessing
 import os
 import random
 import time
+from numbers import Real
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +23,7 @@ from slime.utils.health_monitor import RolloutHealthMonitor
 from slime.utils.http_utils import _wrap_ipv6, find_available_port, get_host_info, init_http_client
 from slime.utils.logging_utils import configure_logger, init_tracking
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step, compute_statistics, dict_add_prefix
-from slime.utils.misc import Box, group_by, load_function
+from slime.utils.misc import Box, group_by, load_function, should_run_periodic_action
 from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from slime.utils.types import Sample
 
@@ -33,6 +34,18 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+
+def _should_save_debug_rollout_data(args, rollout_id: int, evaluation: bool) -> bool:
+    path_template = getattr(args, "save_debug_rollout_data", None)
+    if path_template is None:
+        return False
+    if evaluation:
+        return True
+    interval = getattr(args, "save_debug_rollout_interval", None)
+    if interval is None:
+        interval = getattr(args, "eval_interval", None)
+    return should_run_periodic_action(rollout_id, interval)
 
 
 @dataclasses.dataclass
@@ -640,7 +653,8 @@ class RolloutManager:
 
     def _save_debug_rollout_data(self, data, rollout_id, evaluation: bool):
         # TODO to be refactored (originally Buffer._set_data)
-        if (path_template := self.args.save_debug_rollout_data) is not None:
+        if _should_save_debug_rollout_data(self.args, rollout_id, evaluation):
+            path_template = self.args.save_debug_rollout_data
             path = Path(path_template.format(rollout_id=("eval_" if evaluation else "") + str(rollout_id)))
             logger.info(f"Save debug rollout data to {path}")
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -1173,16 +1187,18 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
     log_dict = extra_metrics or {}
     for key in data.keys():
         rewards = data[key]["rewards"]
-        log_dict[f"eval/{key}"] = sum(rewards) / len(rewards)
+        numeric_rewards = _to_numeric_rewards(rewards)
+        if numeric_rewards is not None:
+            log_dict[f"eval/{key}"] = sum(numeric_rewards) / len(numeric_rewards)
         if (samples := data[key].get("samples")) is not None:
             log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), f"eval/{key}/")
         if "truncated" in data[key]:
             truncated = data[key]["truncated"]
             log_dict[f"eval/{key}-truncated_ratio"] = sum(truncated) / len(truncated)
-        if args.log_passrate:
+        if args.log_passrate and numeric_rewards is not None:
             log_dict |= dict_add_prefix(
                 compute_pass_rate(
-                    flat_rewards=rewards,
+                    flat_rewards=numeric_rewards,
                     group_size=args.n_samples_per_eval_prompt,
                 ),
                 f"eval/{key}-",
@@ -1266,15 +1282,42 @@ def _compute_zero_std_metrics(args, all_samples: list[Sample]):
         return {}
 
     def _is_zero_std(samples: list[Sample]):
-        rewards = [sample.get_reward_value(args) for sample in samples]
-        return len(rewards) == 0 or all(rewards[0] == r for r in rewards)
+        rewards = _to_numeric_rewards([sample.get_reward_value(args) for sample in samples])
+        return rewards is not None and (len(rewards) == 0 or all(rewards[0] == r for r in rewards))
 
     all_sample_groups = group_by(all_samples, lambda s: s.group_index)
     interesting_sample_groups = [g for g in all_sample_groups.values() if _is_zero_std(g)]
 
-    interesting_rewards = [str(round(g[0].get_reward_value(args), 1)) for g in interesting_sample_groups]
+    interesting_rewards = [
+        str(round(_to_numeric_reward(g[0].get_reward_value(args)), 1))
+        for g in interesting_sample_groups
+    ]
 
     return {f"zero_std/count_{reward}": len(items) for reward, items in group_by(interesting_rewards).items()}
+
+
+def _to_numeric_reward(reward: Any) -> float | None:
+    if isinstance(reward, torch.Tensor):
+        if reward.numel() != 1:
+            return None
+        return float(reward.item())
+    if isinstance(reward, np.generic):
+        if np.issubdtype(reward.dtype, np.number):
+            return float(reward.item())
+        return None
+    if isinstance(reward, Real):
+        return float(reward)
+    return None
+
+
+def _to_numeric_rewards(rewards: list[Any]) -> list[float] | None:
+    numeric_rewards = []
+    for reward in rewards:
+        numeric_reward = _to_numeric_reward(reward)
+        if numeric_reward is None:
+            return None
+        numeric_rewards.append(numeric_reward)
+    return numeric_rewards
 
 
 def _compute_spec_metrics(args, all_samples: list[Sample]):

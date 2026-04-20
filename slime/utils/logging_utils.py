@@ -45,6 +45,19 @@ def finish_tracking(args):
         logging.getLogger(__name__).exception("Failed to finish wandb run")
 
 
+def build_lr_metrics(*, optimizer, opt_param_scheduler, metric_prefix: str) -> dict[str, float]:
+    """Build a single aggregate learning-rate metric for logging.
+
+    We intentionally log only the first param group's learning rate to avoid
+    flooding tracking backends like W&B with one chart per param group.
+    """
+
+    if not getattr(optimizer, "param_groups", None):
+        return {}
+
+    return {f"{metric_prefix}lr": opt_param_scheduler.get_lr(optimizer.param_groups[0])}
+
+
 # TODO further refactor, e.g. put TensorBoard init to the "init" part
 def log(args, metrics, step_key: str):
     if args.use_wandb:

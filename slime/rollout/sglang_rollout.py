@@ -31,12 +31,34 @@ from slime.utils.trace_utils import build_sglang_meta_trace_attrs, trace_functio
 from slime.utils.types import Sample
 
 from .rm_hub import async_rm, batched_async_rm
+from .rm_hub.math_utils import grade_answer_verl
 
 __all__ = ["generate_rollout", "get_model_url"]
 
 logger = logging.getLogger(__name__)
 
 _PROCESSOR_PROMPT_KEYS = {"input_ids", "attention_mask"}
+
+
+def _get_eval_reward_for_logging(sample: Sample, reward_key: str | None) -> Any:
+    """Return the scalar reward used for eval aggregation/logging.
+
+    Eval datasets may carry structured labels such as {"ground_truth": ...} while
+    training still uses custom OPD rewards. In that case, prefer computing a
+    task-correctness scalar from the ground truth for eval logging only.
+    """
+
+    if isinstance(sample.label, dict):
+        ground_truth = sample.label.get("ground_truth")
+        if ground_truth is not None:
+            return float(grade_answer_verl(sample.response, ground_truth))
+
+    if isinstance(sample.label, str):
+        return float(grade_answer_verl(sample.response, sample.label))
+
+    if reward_key:
+        return sample.reward[reward_key]
+    return sample.reward
 
 
 def _prepare_prompt_ids(sample: Sample, tokenizer, processor: Any) -> list[int]:
@@ -591,7 +613,7 @@ async def eval_rollout_single_dataset(
     reward_key = args.eval_reward_key or args.reward_key
     return {
         dataset_cfg.name: {
-            "rewards": [sample.reward if not reward_key else sample.reward[reward_key] for sample in data],
+            "rewards": [_get_eval_reward_for_logging(sample, reward_key=reward_key) for sample in data],
             "truncated": [sample.status == Sample.Status.TRUNCATED for sample in data],
             "samples": data,
         }

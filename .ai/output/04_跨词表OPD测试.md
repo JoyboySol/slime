@@ -10,7 +10,7 @@
 
 本次使用资源如下：
 
-- Student model: `/mnt/hdd/lvzhihao/hf_models/Dist-mathcode10b-s1randg-sch1-CPT-200b-stage3-r640k-GDN2.9b-A7-12_20_21_23_46_48_49-sl32768bs128lr2e5-2e5/merged_10ckpts_iter_61984-hf_to_iter_71525-hf_mean`
+- Student model: `/mnt/hdd/lvzhihao/hf_models/YuLan-Mini-Nanbeige-Distill`
 - Teacher model: `/mnt/hdd/Nanbeige4.1-3B`
 - Data: `/mnt/hdd/huanglisheng/train_data/G-OPD-Training-Data/DeepMath-103K/slime_style_train_data.jsonl`
 - GPU 分配：train 使用 `4,5,6`，teacher 使用 `7`

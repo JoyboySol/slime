@@ -648,8 +648,13 @@ def train(
             if args.enable_mtp_training:
                 log_dict[f"train/{role_tag}mtp_loss"] = mtp_losses
 
-            for param_group_id, param_group in enumerate(optimizer.param_groups):
-                log_dict[f"train/{role_tag}lr-pg_{param_group_id}"] = opt_param_scheduler.get_lr(param_group)
+            log_dict.update(
+                logging_utils.build_lr_metrics(
+                    optimizer=optimizer,
+                    opt_param_scheduler=opt_param_scheduler,
+                    metric_prefix=f"train/{role_tag}",
+                )
+            )
 
             log_dict["train/step"] = accumulated_step_id
             logging_utils.log(args, log_dict, step_key="train/step")

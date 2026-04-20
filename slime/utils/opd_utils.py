@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 from functools import lru_cache
+import logging
 
 import torch
+from transformers.models.gpt2.tokenization_gpt2 import bytes_to_unicode
 
 from slime.utils.processing_utils import load_tokenizer
+
+logger = logging.getLogger(__name__)
+_BYTE_LEVEL_CHAR_TO_BYTE = {v: k for k, v in bytes_to_unicode().items()}
 
 
 @lru_cache(maxsize=8)
@@ -33,7 +38,65 @@ def _build_char_to_byte_offsets(text: str) -> list[int]:
     return offsets
 
 
-def build_token_byte_spans(tokenizer, text: str, token_ids: list[int]) -> tuple[list[bytes], list[tuple[int, int]]]:
+def _build_token_byte_spans_via_prefix_decode(tokenizer, token_ids: list[int]) -> tuple[list[bytes], list[tuple[int, int]]]:
+    token_bytes = []
+    token_byte_spans = []
+    prefix_text = ""
+    byte_offset = 0
+    for index in range(len(token_ids)):
+        decoded_prefix = decode_token_ids(tokenizer, token_ids[: index + 1])
+        if not decoded_prefix.startswith(prefix_text):
+            raise ValueError("Tokenizer decode is not prefix-consistent; cannot reconstruct byte spans.")
+        token_text = decoded_prefix[len(prefix_text) :]
+        token_text_bytes = token_text.encode("utf-8")
+        token_bytes.append(token_text_bytes)
+        token_byte_spans.append((byte_offset, byte_offset + len(token_text_bytes)))
+        prefix_text = decoded_prefix
+        byte_offset += len(token_text_bytes)
+    return token_bytes, token_byte_spans
+
+
+def _token_piece_to_bytes(token_piece: str) -> bytes:
+    raw = bytearray()
+    for char in token_piece:
+        if char in _BYTE_LEVEL_CHAR_TO_BYTE:
+            raw.append(_BYTE_LEVEL_CHAR_TO_BYTE[char])
+        else:
+            raw.extend(char.encode("utf-8"))
+    return bytes(raw)
+
+
+def _build_token_byte_spans_via_token_strings(
+    tokenizer, text: str, token_ids: list[int]
+) -> tuple[list[bytes], list[tuple[int, int]]]:
+    if not hasattr(tokenizer, "convert_ids_to_tokens"):
+        raise ValueError("Tokenizer does not expose convert_ids_to_tokens.")
+
+    token_pieces = tokenizer.convert_ids_to_tokens(token_ids)
+    if len(token_pieces) != len(token_ids):
+        raise ValueError("Tokenizer convert_ids_to_tokens returned unexpected token count.")
+
+    token_bytes = []
+    token_byte_spans = []
+    byte_offset = 0
+    for token_piece in token_pieces:
+        piece_bytes = _token_piece_to_bytes(token_piece)
+        token_bytes.append(piece_bytes)
+        token_byte_spans.append((byte_offset, byte_offset + len(piece_bytes)))
+        byte_offset += len(piece_bytes)
+
+    if b"".join(token_bytes) != text.encode("utf-8"):
+        raise ValueError("Tokenizer token strings do not reconstruct the source text.")
+    return token_bytes, token_byte_spans
+
+
+def _build_token_byte_spans(
+    tokenizer,
+    text: str,
+    token_ids: list[int],
+    *,
+    allow_prefix_fallback: bool,
+) -> tuple[list[bytes], list[tuple[int, int]]]:
     try:
         tokenized = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
         if tokenized["input_ids"] != token_ids:
@@ -41,32 +104,56 @@ def build_token_byte_spans(tokenizer, text: str, token_ids: list[int]) -> tuple[
                 "Token ids do not match tokenizer encoding for response text: "
                 f"expected={token_ids}, got={tokenized['input_ids']}"
             )
+        if len(tokenized["offset_mapping"]) != len(token_ids):
+            raise ValueError("Tokenizer offset mapping count does not match token count.")
 
         char_to_byte_offsets = _build_char_to_byte_offsets(text)
         token_bytes = []
         token_byte_spans = []
-        for start_char, end_char in tokenized["offset_mapping"]:
+        offset_mapping = list(tokenized["offset_mapping"])
+        previous_start_char = 0
+        previous_end_char = 0
+        for index, (start_char, end_char) in enumerate(offset_mapping):
+            if index > 0 and start_char < previous_start_char:
+                raise ValueError("Tokenizer offset mapping is not monotonic.")
             start_byte = char_to_byte_offsets[start_char]
             end_byte = char_to_byte_offsets[end_char]
-            token_bytes.append(text[start_char:end_char].encode("utf-8"))
-            token_byte_spans.append((start_byte, end_byte))
+            token_text_bytes = text[start_char:end_char].encode("utf-8")
+            next_same_span = index + 1 < len(offset_mapping) and offset_mapping[index + 1] == (start_char, end_char)
+            prev_same_span = index > 0 and offset_mapping[index - 1] == (start_char, end_char)
+            if token_text_bytes and (prev_same_span or next_same_span):
+                if next_same_span:
+                    token_bytes.append(b"")
+                    token_byte_spans.append((start_byte, start_byte))
+                else:
+                    token_bytes.append(token_text_bytes)
+                    token_byte_spans.append((start_byte, end_byte))
+            else:
+                token_bytes.append(token_text_bytes)
+                token_byte_spans.append((start_byte, end_byte))
+            previous_start_char = start_char
+            previous_end_char = end_char
+
+        if b"".join(token_bytes) != text.encode("utf-8"):
+            raise ValueError("Tokenizer offset mapping bytes do not reconstruct the source text.")
         return token_bytes, token_byte_spans
     except Exception:
-        token_bytes = []
-        token_byte_spans = []
-        prefix_text = ""
-        byte_offset = 0
-        for index in range(len(token_ids)):
-            decoded_prefix = decode_token_ids(tokenizer, token_ids[: index + 1])
-            if not decoded_prefix.startswith(prefix_text):
-                raise ValueError("Tokenizer decode is not prefix-consistent; cannot reconstruct byte spans.")
-            token_text = decoded_prefix[len(prefix_text) :]
-            token_text_bytes = token_text.encode("utf-8")
-            token_bytes.append(token_text_bytes)
-            token_byte_spans.append((byte_offset, byte_offset + len(token_text_bytes)))
-            prefix_text = decoded_prefix
-            byte_offset += len(token_text_bytes)
-        return token_bytes, token_byte_spans
+        try:
+            return _build_token_byte_spans_via_token_strings(tokenizer, text, token_ids)
+        except Exception as exc:
+            if allow_prefix_fallback:
+                return _build_token_byte_spans_via_prefix_decode(tokenizer, token_ids)
+            raise ValueError("Tokenizer token/offset reconstruction failed.") from exc
+
+
+def build_token_byte_spans(tokenizer, text: str, token_ids: list[int]) -> tuple[list[bytes], list[tuple[int, int]]]:
+    return _build_token_byte_spans(tokenizer, text, token_ids, allow_prefix_fallback=True)
+
+
+def build_token_byte_spans_strict(
+    tokenizer, text: str, token_ids: list[int]
+) -> tuple[list[bytes], list[tuple[int, int]]]:
+    return _build_token_byte_spans(tokenizer, text, token_ids, allow_prefix_fallback=False)
 
 
 def clip_token_bytes_by_region(
@@ -133,9 +220,38 @@ def align_token_byte_chunks(
     return chunks
 
 
+def build_contextual_suffix_token_bytes(
+    tokenizer,
+    full_token_ids: list[int],
+    suffix_start_index: int,
+    prefix_text: str,
+    full_text: str | None = None,
+) -> tuple[list[bytes], list[tuple[int, int]]]:
+    if full_text is None:
+        full_text = decode_token_ids(tokenizer, full_token_ids)
+    token_bytes, token_byte_spans = build_token_byte_spans_strict(tokenizer, full_text, full_token_ids)
+
+    prompt_byte_length = len(prefix_text.encode("utf-8"))
+    clipped_bytes: list[bytes] = []
+    clipped_spans: list[tuple[int, int]] = []
+    for token_byte, (token_start, token_end) in zip(token_bytes[suffix_start_index:], token_byte_spans[suffix_start_index:], strict=False):
+        if token_end <= prompt_byte_length:
+            continue
+        if token_start < prompt_byte_length:
+            rel_start = prompt_byte_length - token_start
+            clipped_bytes.append(token_byte[rel_start:])
+            clipped_spans.append((0, token_end - prompt_byte_length))
+            continue
+        clipped_bytes.append(token_byte)
+        clipped_spans.append((token_start - prompt_byte_length, token_end - prompt_byte_length))
+
+    return clipped_bytes, clipped_spans
+
+
 def compute_byte_chunk_reverse_kl(
     *,
     full_text: str,
+    prompt_text: str | None = None,
     prompt_token_count: int,
     student_token_ids: list[int],
     response_token_count: int,
@@ -143,68 +259,144 @@ def compute_byte_chunk_reverse_kl(
     teacher_log_probs: torch.Tensor,
     student_tokenizer,
     teacher_tokenizer,
+    allow_sequence_fallback: bool = True,
 ) -> torch.Tensor:
+    student_chunk_log_probs, teacher_chunk_log_probs = compute_byte_chunk_aligned_log_probs(
+        full_text=full_text,
+        prompt_text=prompt_text,
+        prompt_token_count=prompt_token_count,
+        student_token_ids=student_token_ids,
+        response_token_count=response_token_count,
+        student_log_probs=student_log_probs,
+        teacher_log_probs=teacher_log_probs,
+        student_tokenizer=student_tokenizer,
+        teacher_tokenizer=teacher_tokenizer,
+        allow_sequence_fallback=allow_sequence_fallback,
+    )
+    return student_chunk_log_probs - teacher_chunk_log_probs
+
+
+def compute_byte_chunk_aligned_log_probs(
+    *,
+    full_text: str,
+    prompt_text: str | None = None,
+    prompt_token_count: int,
+    student_token_ids: list[int],
+    response_token_count: int,
+    student_log_probs: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    student_tokenizer,
+    teacher_tokenizer,
+    allow_sequence_fallback: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
     if len(student_token_ids) != prompt_token_count + response_token_count:
         raise ValueError("Student full token ids length does not match prompt/response split.")
     if response_token_count != student_log_probs.numel():
         raise ValueError("Student response token count and log_probs length mismatch.")
 
-    student_token_bytes, student_token_spans = build_token_byte_spans(student_tokenizer, full_text, student_token_ids)
     if response_token_count == 0:
-        return torch.empty_like(student_log_probs)
-    response_start_index = len(student_token_ids) - response_token_count
-    prompt_byte_length = student_token_spans[response_start_index][0]
+        empty = torch.empty_like(student_log_probs)
+        return empty, empty
+    prompt_token_ids = student_token_ids[:prompt_token_count]
+    response_token_ids = student_token_ids[prompt_token_count:]
+    if prompt_text is None:
+        prompt_text = decode_token_ids(student_tokenizer, prompt_token_ids)
+    response_text = decode_token_ids(student_tokenizer, response_token_ids)
+    prompt_byte_length = len(prompt_text.encode("utf-8"))
 
-    student_response_bytes, _student_response_indices = clip_token_bytes_by_region(
-        student_token_bytes[response_start_index:],
-        student_token_spans[response_start_index:],
-        start_byte=prompt_byte_length,
-    )
+    def _preview(tokenizer, token_ids, token_bytes):
+        preview = []
+        for token_id, token_byte in zip(token_ids[:8], token_bytes[:8], strict=False):
+            token_text = decode_token_ids(tokenizer, [token_id])
+            preview.append(
+                {
+                    "id": token_id,
+                    "text": repr(token_text),
+                    "bytes_len": len(token_byte),
+                    "bytes_hex": token_byte[:16].hex(),
+                }
+            )
+        return preview
+
+    def _sequence_fallback(
+        reason: str, *, student_preview_bytes: list[bytes] | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not allow_sequence_fallback:
+            raise ValueError(
+                "byte_chunk preparation/alignment failure with sequence fallback disabled: "
+                f"{reason}"
+            )
+        logger.warning(
+            "Falling back to sequence-level OPD penalty after byte_chunk preparation/alignment failure. "
+            "reason=%s prompt_token_count=%s response_token_count=%s prompt_byte_length=%s "
+            "student_token_count=%s teacher_log_prob_count=%s student_preview=%s",
+            reason,
+            prompt_token_count,
+            response_token_count,
+            prompt_byte_length,
+            len(student_token_ids),
+            teacher_log_probs.numel(),
+            _preview(student_tokenizer, response_token_ids, student_preview_bytes or []),
+        )
+        student_sequence_log_prob = student_log_probs.sum() / response_token_count
+        teacher_sequence_log_prob = teacher_log_probs.sum() / response_token_count
+        return (
+            torch.full_like(student_log_probs, student_sequence_log_prob.item()),
+            torch.full_like(student_log_probs, teacher_sequence_log_prob.item()),
+        )
+
+    try:
+        student_response_bytes, _student_response_spans = build_contextual_suffix_token_bytes(
+            student_tokenizer, student_token_ids, prompt_token_count, prompt_text
+        )
+    except ValueError:
+        try:
+            student_response_bytes, _student_response_spans = build_token_byte_spans(
+                student_tokenizer, response_text, response_token_ids
+            )
+        except ValueError as exc:
+            return _sequence_fallback(f"student_byte_reconstruction_failed: {exc}")
 
     teacher_token_ids = encode_text(teacher_tokenizer, full_text)
-    teacher_token_bytes, teacher_token_spans = build_token_byte_spans(teacher_tokenizer, full_text, teacher_token_ids)
-    teacher_response_bytes, teacher_response_indices = clip_token_bytes_by_region(
-        teacher_token_bytes,
-        teacher_token_spans,
-        start_byte=prompt_byte_length,
-    )
-    if len(teacher_response_indices) != teacher_log_probs.numel():
-        raise ValueError(
-            "Teacher response token count and log_probs length mismatch. "
-            f"selected={len(teacher_response_indices)}, log_probs={teacher_log_probs.numel()}"
+    try:
+        teacher_token_bytes, teacher_token_spans = build_token_byte_spans(teacher_tokenizer, full_text, teacher_token_ids)
+        teacher_response_bytes, teacher_response_indices = clip_token_bytes_by_region(
+            teacher_token_bytes,
+            teacher_token_spans,
+            start_byte=prompt_byte_length,
         )
+        if len(teacher_response_indices) != teacher_log_probs.numel():
+            raise ValueError(
+                "Teacher response token count and log_probs length mismatch. "
+                f"selected={len(teacher_response_indices)}, log_probs={teacher_log_probs.numel()}"
+            )
+    except ValueError as exc:
+        return _sequence_fallback(f"teacher_byte_reconstruction_failed: {exc}", student_preview_bytes=student_response_bytes)
     try:
         chunks = align_token_byte_chunks(student_response_bytes, teacher_response_bytes)
     except ValueError as exc:
-        def _preview(tokenizer, token_ids, token_bytes):
-            preview = []
-            for token_id, token_byte in zip(token_ids[:8], token_bytes[:8], strict=False):
-                token_text = decode_token_ids(tokenizer, [token_id])
-                preview.append(
-                    {
-                        "id": token_id,
-                        "text": repr(token_text),
-                        "bytes_len": len(token_byte),
-                        "bytes_hex": token_byte[:16].hex(),
-                    }
-                )
-            return preview
+        logger.warning(
+            "Falling back to sequence-level OPD penalty after byte_chunk alignment failure. "
+            "prompt_token_count=%s response_token_count=%s prompt_byte_length=%s "
+            "student_token_count=%s teacher_token_count=%s student_preview=%s teacher_preview=%s error=%s",
+            prompt_token_count,
+            response_token_count,
+            prompt_byte_length,
+            len(student_token_ids),
+            len(teacher_token_ids),
+            _preview(student_tokenizer, response_token_ids, student_response_bytes),
+            _preview(teacher_tokenizer, [teacher_token_ids[i] for i in teacher_response_indices], teacher_response_bytes),
+            exc,
+        )
+        return _sequence_fallback(f"alignment_failed: {exc}", student_preview_bytes=student_response_bytes)
 
-        raise ValueError(
-            "Failed to align byte_chunk OPD token bytes. "
-            f"full_text={full_text!r}, prompt_token_count={prompt_token_count}, response_token_count={response_token_count}, "
-            f"prompt_byte_length={prompt_byte_length}, "
-            f"student_token_count={len(student_token_ids)}, teacher_token_count={len(teacher_token_ids)}, "
-            f"student_preview={_preview(student_tokenizer, student_token_ids[response_start_index:], student_response_bytes)}, "
-            f"teacher_preview={_preview(teacher_tokenizer, [teacher_token_ids[i] for i in teacher_response_indices], teacher_response_bytes)}"
-        ) from exc
-
-    reverse_kl = torch.empty_like(student_log_probs)
+    student_chunk_log_probs = torch.empty_like(student_log_probs)
+    teacher_chunk_log_probs = torch.empty_like(student_log_probs)
     for student_slice, teacher_slice, _chunk_bytes in chunks:
         student_chunk_log_prob = student_log_probs[student_slice].sum()
         teacher_chunk_log_prob = teacher_log_probs[teacher_slice].sum()
-        student_chunk_penalty = student_chunk_log_prob - teacher_chunk_log_prob
         student_chunk_length = student_slice.stop - student_slice.start
-        reverse_kl[student_slice] = student_chunk_penalty / student_chunk_length
+        student_chunk_log_probs[student_slice] = student_chunk_log_prob / student_chunk_length
+        teacher_chunk_log_probs[student_slice] = teacher_chunk_log_prob / student_chunk_length
 
-    return reverse_kl
+    return student_chunk_log_probs, teacher_chunk_log_probs
