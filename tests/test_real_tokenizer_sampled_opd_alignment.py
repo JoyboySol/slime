@@ -51,8 +51,8 @@ def _collect_rows(path: str, limit: int) -> list[tuple[Path, int, dict]]:
 @pytest.mark.parametrize(
     ("dataset_name", "dataset_path", "sample_limit"),
     [
-        ("short", SHORT_DATA_PATH, 2),
-        ("long", LONG_DATA_PATH, 2),
+        ("short", SHORT_DATA_PATH, 128),
+        ("long", LONG_DATA_PATH, 128),
     ],
 )
 def test_sampled_real_tokenizer_byte_alignment_matches_teacher_bytes(dataset_name, dataset_path, sample_limit):

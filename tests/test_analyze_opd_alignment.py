@@ -86,7 +86,27 @@ def test_analyze_row_requires_contextual_suffix_reconstruction():
     )
 
     assert result.status == "ok"
-    assert result.student_reconstruction_mode == "contextual_suffix"
+    assert result.student_reconstruction_mode == "recorded_builder"
+
+
+def test_analyze_row_prefers_recorded_payload_when_present():
+    module = load_module()
+    row = {
+        "messages": [{"role": "user", "content": "Hello"}, {"role": "assistant", "content": "OK"}],
+        "opd_student_response_bytes": [79, 75],
+        "opd_student_token_byte_spans": [[0, 1], [1, 2]],
+    }
+
+    result = module.analyze_row(
+        row,
+        source_file=Path("sample.jsonl"),
+        row_index=0,
+        student_tokenizer=ChatTemplateTokenizer(),
+        teacher_tokenizer=ChatTemplateTokenizer(),
+    )
+
+    assert result.status == "ok"
+    assert result.student_reconstruction_mode == "recorded_payload"
 
 
 @pytest.mark.unit

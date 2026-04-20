@@ -15,6 +15,7 @@ import pandas as pd
 
 from slime.utils.opd_utils import (
     align_token_byte_chunks,
+    build_recorded_student_response_alignment,
     build_contextual_suffix_token_bytes,
     build_token_byte_spans,
     clip_token_bytes_by_region,
@@ -161,6 +162,7 @@ def analyze_row(
 
     rendered_full_text = _apply_chat_template(student_tokenizer, messages, tokenize=False, tools=tools)
     rendered_prompt_text = _apply_prompt_template(student_tokenizer, prompt_messages, tokenize=False, tools=tools)
+    rendered_response_text = rendered_full_text[len(rendered_prompt_text) :]
 
     student_full_token_ids = list(_apply_chat_template(student_tokenizer, messages, tokenize=True, tools=tools))
     prompt_token_ids = list(_apply_prompt_template(student_tokenizer, prompt_messages, tokenize=True, tools=tools))
@@ -171,15 +173,27 @@ def analyze_row(
     decoded_full_text = decode_token_ids(student_tokenizer, student_full_token_ids)
     decoded_prompt_text = decode_token_ids(student_tokenizer, prompt_token_ids)
     decoded_response_text = decode_token_ids(student_tokenizer, response_token_ids)
-
-    student_response_token_bytes, _student_response_spans = build_contextual_suffix_token_bytes(
-        student_tokenizer,
-        student_full_token_ids,
-        len(prompt_token_ids),
-        rendered_prompt_text,
-        full_text=rendered_full_text,
-    )
-    student_reconstruction_mode = "contextual_suffix"
+    recorded_response_bytes = row.get("opd_student_response_bytes")
+    recorded_token_spans = row.get("opd_student_token_byte_spans")
+    if recorded_response_bytes is not None and recorded_token_spans is not None:
+        response_bytes = bytes(recorded_response_bytes)
+        student_response_token_bytes = [
+            response_bytes[int(start) : int(end)] for start, end in recorded_token_spans
+        ]
+        student_reconstruction_mode = "recorded_payload"
+    else:
+        student_response_bytes_recorded, student_response_spans = build_recorded_student_response_alignment(
+            student_tokenizer,
+            full_token_ids=student_full_token_ids,
+            prompt_token_count=len(prompt_token_ids),
+            prompt_text=rendered_prompt_text,
+            response_text=rendered_response_text,
+            full_text=rendered_full_text,
+        )
+        student_response_token_bytes = [
+            student_response_bytes_recorded[start:end] for start, end in student_response_spans
+        ]
+        student_reconstruction_mode = "recorded_builder"
 
     teacher_token_ids = encode_text(teacher_tokenizer, rendered_full_text)
     teacher_token_bytes, teacher_token_spans = build_token_byte_spans(teacher_tokenizer, rendered_full_text, teacher_token_ids)

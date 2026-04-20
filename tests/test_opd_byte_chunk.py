@@ -362,6 +362,59 @@ def test_replay_summary_marks_teacher_stage_failures(monkeypatch):
     assert summary["response_preview"] == "R"
 
 
+def test_replay_summary_prefers_recorded_student_alignment(monkeypatch):
+    spec = importlib.util.spec_from_file_location(
+        "replay_debug_rollout_opd",
+        "/mnt/ssd/lvzhihao/PostTrain/slime/scripts/replay_debug_rollout_opd.py",
+    )
+    replay_module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(replay_module)
+
+    sample = Sample(
+        prompt="P",
+        tokens=[1, 2, 3],
+        response="AB",
+        response_length=2,
+        rollout_log_probs=[-0.2, -0.3],
+        reward={"meta_info": {"input_token_logprobs": [[0.0, 999], [-0.4, 10]]}},
+        opd_full_text="PAB",
+        opd_prompt_text="P",
+        opd_response_text="AB",
+        opd_student_response_bytes=[65, 66],
+        opd_student_token_byte_spans=[[0, 1], [1, 2]],
+    )
+    args = Namespace(
+        hf_checkpoint="student",
+        teacher_hf_checkpoint="teacher",
+        preview_chars=32,
+    )
+
+    monkeypatch.setattr(replay_module, "get_cached_tokenizer", lambda _path: object())
+    monkeypatch.setattr(replay_module, "compute_teacher_log_probs_for_sample", lambda *_: torch.tensor([-0.4]))
+
+    def fake_build_token_byte_spans(_tokenizer, full_text, token_ids):
+        assert full_text == "PAB"
+        assert token_ids == [10, 11]
+        return [b"P", b"AB"], [(0, 1), (1, 3)]
+
+    monkeypatch.setattr(replay_module, "encode_text", lambda _tokenizer, _text: [10, 11])
+    monkeypatch.setattr(replay_module, "build_token_byte_spans", fake_build_token_byte_spans)
+
+    def fake_compute_byte_chunk_aligned_log_probs(**kwargs):
+        assert kwargs["recorded_student_response_bytes"] == [65, 66]
+        assert kwargs["recorded_student_token_byte_spans"] == [[0, 1], [1, 2]]
+        return torch.tensor([-0.25, -0.25]), torch.tensor([-0.2, -0.2])
+
+    monkeypatch.setattr(replay_module, "compute_byte_chunk_aligned_log_probs", fake_compute_byte_chunk_aligned_log_probs)
+
+    summary = replay_module._summarize_sample(sample, args)
+
+    assert summary["byte_chunk_alignment"] == "ok"
+    assert summary["student_alignment_source"] == "recorded_payload"
+    assert summary["student_chunk_mean"] == pytest.approx(-0.25)
+
+
 def test_replay_normalize_args_sets_opd_teacher_checkpoint():
     spec = importlib.util.spec_from_file_location(
         "replay_debug_rollout_opd",

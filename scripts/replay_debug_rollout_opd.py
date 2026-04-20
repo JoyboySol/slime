@@ -79,9 +79,14 @@ def _summarize_sample(sample: Sample, args: argparse.Namespace) -> dict:
             teacher_log_probs=teacher_log_probs,
             student_tokenizer=student_tokenizer,
             teacher_tokenizer=teacher_tokenizer,
+            recorded_student_response_bytes=sample.opd_student_response_bytes,
+            recorded_student_token_byte_spans=sample.opd_student_token_byte_spans,
             allow_sequence_fallback=False,
         )
         summary["byte_chunk_alignment"] = "ok"
+        summary["student_alignment_source"] = (
+            "recorded_payload" if sample.opd_student_response_bytes is not None else "legacy_reconstruction"
+        )
         summary["student_chunk_mean"] = float(student_chunk_log_probs.mean().item())
         summary["teacher_chunk_mean"] = float(teacher_chunk_log_probs.mean().item())
     except Exception as exc:  # noqa: BLE001
