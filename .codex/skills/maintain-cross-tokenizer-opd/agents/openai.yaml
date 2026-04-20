@@ -1,0 +1,4 @@
+interface:
+  display_name: "Maintain Cross-Tokenizer OPD"
+  short_description: "Maintain cross-tokenizer OPD flow"
+  default_prompt: "Use $maintain-cross-tokenizer-opd to maintain the cross-tokenizer OPD training and diagnostics pipeline."
