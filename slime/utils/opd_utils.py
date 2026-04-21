@@ -67,6 +67,9 @@ def _build_token_byte_spans_via_prefix_decode(tokenizer, token_ids: list[int]) -
 def _token_piece_to_bytes(token_piece: str) -> bytes:
     raw = bytearray()
     for char in token_piece:
+        if char == "▁":
+            raw.append(0x20)
+            continue
         if char in _BYTE_LEVEL_CHAR_TO_BYTE:
             raw.append(_BYTE_LEVEL_CHAR_TO_BYTE[char])
         else:
@@ -289,6 +292,26 @@ def validate_recorded_student_response_alignment(
         raise ValueError("Recorded student response spans do not cover the full response bytes.")
 
     return token_bytes, normalized_spans
+
+
+def build_recorded_student_response_alignment_from_token_texts(
+    *,
+    response_text: str,
+    response_token_texts: list[str],
+) -> tuple[bytes, list[tuple[int, int]]]:
+    canonical_response_bytes = response_text.encode("utf-8")
+    token_bytes = [token_text.encode("utf-8") for token_text in response_token_texts]
+    if b"".join(token_bytes) != canonical_response_bytes:
+        raise ValueError("Generation token texts do not match canonical response text bytes.")
+
+    cursor = 0
+    token_byte_spans: list[tuple[int, int]] = []
+    for token_byte in token_bytes:
+        end = cursor + len(token_byte)
+        token_byte_spans.append((cursor, end))
+        cursor = end
+
+    return canonical_response_bytes, token_byte_spans
 
 
 def build_recorded_student_response_alignment(

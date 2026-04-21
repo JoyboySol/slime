@@ -87,6 +87,9 @@ def _summarize_sample(sample: Sample, args: argparse.Namespace) -> dict:
         summary["student_alignment_source"] = (
             "recorded_payload" if sample.opd_student_response_bytes is not None else "legacy_reconstruction"
         )
+        summary["recorded_alignment_source"] = sample.opd_student_alignment_source
+        summary["recorded_alignment_validated"] = sample.opd_student_alignment_validated
+        summary["recorded_alignment_status"] = sample.opd_student_alignment_status
         summary["student_chunk_mean"] = float(student_chunk_log_probs.mean().item())
         summary["teacher_chunk_mean"] = float(teacher_chunk_log_probs.mean().item())
     except Exception as exc:  # noqa: BLE001
@@ -98,6 +101,9 @@ def _summarize_sample(sample: Sample, args: argparse.Namespace) -> dict:
             "rollout_log_prob_count": len(sample.rollout_log_probs or []),
             "byte_chunk_alignment": f"failed:{type(exc).__name__}",
             "error": str(exc),
+            "recorded_alignment_source": sample.opd_student_alignment_source,
+            "recorded_alignment_validated": sample.opd_student_alignment_validated,
+            "recorded_alignment_status": sample.opd_student_alignment_status,
             "prompt_preview": (prompt_text or "")[: args.preview_chars],
             "response_preview": (sample.response or "")[: args.preview_chars],
         }

@@ -543,7 +543,7 @@ class MegatronTrainRayActor(TrainRayActor):
             if self.rollout_data_postprocess is not None:
                 self.rollout_data_postprocess(self.args, rollout_id, rollout_data)
 
-            log_rollout_data(
+            rollout_summary = log_rollout_data(
                 rollout_id,
                 self.args,
                 rollout_data,
@@ -584,6 +584,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.weights_backuper.backup("ref")
 
         log_perf_data(rollout_id, self.args)
+        return rollout_summary
 
     @timer
     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:

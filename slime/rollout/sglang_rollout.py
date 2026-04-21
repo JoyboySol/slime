@@ -196,6 +196,7 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     payload = {
         "sampling_params": sampling_params,
         "return_logprob": True,
+        "return_text_in_logprobs": True,
     }
 
     if args.use_rollout_routing_replay:
@@ -226,8 +227,9 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     if "output_token_logprobs" in output["meta_info"]:
         new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
         new_response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
+        new_response_token_texts = [item[2] for item in output["meta_info"]["output_token_logprobs"] if len(item) >= 3]
     else:
-        new_response_tokens, new_response_log_probs = [], []
+        new_response_tokens, new_response_log_probs, new_response_token_texts = [], [], []
 
     # Update sample with tokens directly - avoiding re-tokenization
     sample.tokens = sample.tokens + new_response_tokens
@@ -242,6 +244,10 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     if sample.rollout_log_probs is None:
         sample.rollout_log_probs = []
     sample.rollout_log_probs += new_response_log_probs
+    if len(new_response_token_texts) == len(new_response_tokens):
+        if sample.opd_student_token_texts is None:
+            sample.opd_student_token_texts = []
+        sample.opd_student_token_texts += new_response_token_texts
 
     if "routed_experts" in output["meta_info"]:
         sample.rollout_routed_experts = np.frombuffer(

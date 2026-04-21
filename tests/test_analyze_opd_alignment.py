@@ -95,6 +95,9 @@ def test_analyze_row_prefers_recorded_payload_when_present():
         "messages": [{"role": "user", "content": "Hello"}, {"role": "assistant", "content": "OK"}],
         "opd_student_response_bytes": [79, 75],
         "opd_student_token_byte_spans": [[0, 1], [1, 2]],
+        "opd_student_alignment_source": "recorded_builder",
+        "opd_student_alignment_validated": True,
+        "opd_student_alignment_status": "ok_recorded",
     }
 
     result = module.analyze_row(
@@ -107,6 +110,9 @@ def test_analyze_row_prefers_recorded_payload_when_present():
 
     assert result.status == "ok"
     assert result.student_reconstruction_mode == "recorded_payload"
+    assert result.recorded_alignment_source == "recorded_builder"
+    assert result.recorded_alignment_validated is True
+    assert result.recorded_alignment_status == "ok_recorded"
 
 
 @pytest.mark.unit

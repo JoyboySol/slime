@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from slime.rollout.on_policy_distillation import (
+    _build_canonical_opd_texts,
     _record_student_opd_alignment,
     compute_teacher_log_probs_for_sample,
     post_process_rewards,
@@ -100,6 +101,15 @@ class BoundaryAwareTokenizer(FakeTokenizer):
         return [self.token_map[token_id] for token_id in token_ids]
 
 
+class SentencePieceLikeTokenizer(BoundaryAwareTokenizer):
+    def __init__(self, token_map, encode_map, token_piece_map, decode_map=None, offsets_map=None):
+        super().__init__(token_map, encode_map, decode_map=decode_map, offsets_map=offsets_map)
+        self.token_piece_map = token_piece_map
+
+    def convert_ids_to_tokens(self, token_ids):
+        return [self.token_piece_map[token_id] for token_id in token_ids]
+
+
 def test_build_contextual_suffix_token_bytes_uses_full_text_offsets_instead_of_prefix_decode():
     tokenizer = BoundaryAwareTokenizer(
         token_map={100: "<|im_start|>", 101: " user", 102: "\n", 103: "O", 104: "K"},
@@ -172,7 +182,21 @@ def test_build_token_byte_spans_falls_back_to_token_strings_when_prefix_decode_i
 
     assert b"".join(token_bytes) == "你好".encode("utf-8")
     assert token_bytes == ["你".encode("utf-8"), "好".encode("utf-8")]
-    assert token_spans == [(0, 3), (3, 6)]
+
+
+def test_build_token_byte_spans_token_string_fallback_understands_sentencepiece_space_marker():
+    tokenizer = SentencePieceLikeTokenizer(
+        token_map={10: "We", 11: "are", 12: "given"},
+        encode_map={"We are given": [10, 11, 12]},
+        token_piece_map={10: "We", 11: "▁are", 12: "▁given"},
+        offsets_map={"We are given": [(0, 2), (0, 0), (0, 0)]},
+    )
+
+    token_bytes, token_spans = opd_utils.build_token_byte_spans(tokenizer, "We are given", [10, 11, 12])
+
+    assert b"".join(token_bytes) == b"We are given"
+    assert token_bytes == [b"We", b" are", b" given"]
+    assert token_spans == [(0, 2), (2, 6), (6, 12)]
 
 
 def test_validate_recorded_student_response_alignment_accepts_valid_payload():
@@ -383,6 +407,9 @@ def test_replay_summary_prefers_recorded_student_alignment(monkeypatch):
         opd_response_text="AB",
         opd_student_response_bytes=[65, 66],
         opd_student_token_byte_spans=[[0, 1], [1, 2]],
+        opd_student_alignment_source="recorded_builder",
+        opd_student_alignment_validated=True,
+        opd_student_alignment_status="ok_recorded",
     )
     args = Namespace(
         hf_checkpoint="student",
@@ -412,6 +439,9 @@ def test_replay_summary_prefers_recorded_student_alignment(monkeypatch):
 
     assert summary["byte_chunk_alignment"] == "ok"
     assert summary["student_alignment_source"] == "recorded_payload"
+    assert summary["recorded_alignment_source"] == "recorded_builder"
+    assert summary["recorded_alignment_validated"] is True
+    assert summary["recorded_alignment_status"] == "ok_recorded"
     assert summary["student_chunk_mean"] == pytest.approx(-0.25)
 
 
@@ -1138,8 +1168,147 @@ def test_record_student_opd_alignment_stores_response_bytes_and_spans():
 
     assert sample.opd_student_response_bytes == [65, 66]
     assert sample.opd_student_token_byte_spans == [[0, 1], [1, 2]]
+    assert sample.opd_student_alignment_source == "recorded_builder"
+    assert sample.opd_student_alignment_validated is True
+    assert sample.opd_student_alignment_status == "ok_recorded"
     assert sample.opd_student_alignment_version == 1
     assert sample.opd_student_alignment_error is None
+
+
+def test_record_student_opd_alignment_marks_failed_recording_metadata(monkeypatch):
+    sample = Sample(
+        tokens=[1, 2, 3],
+        response_length=2,
+        opd_prompt_text="P",
+        opd_response_text="AB",
+        opd_full_text="PAB",
+    )
+    student_tokenizer = BoundaryAwareTokenizer(
+        token_map={1: "P", 2: "A", 3: "B"},
+        encode_map={"PAB": [1, 2, 3], "AB": [2, 3]},
+    )
+
+    monkeypatch.setattr(
+        "slime.rollout.on_policy_distillation.build_recorded_student_response_alignment",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("boom")),
+    )
+
+    _record_student_opd_alignment(sample, student_tokenizer)
+
+    assert sample.opd_student_response_bytes is None
+    assert sample.opd_student_token_byte_spans is None
+    assert sample.opd_student_alignment_source == "recorded_builder"
+    assert sample.opd_student_alignment_validated is False
+    assert sample.opd_student_alignment_status == "recorded_missing"
+    assert sample.opd_student_alignment_error == "boom"
+
+
+def test_canonical_opd_texts_fall_back_to_token_derived_text_when_rendered_response_is_not_token_consistent():
+    sample = Sample(
+        prompt="PROMPT",
+        response="bad rendered response",
+        tokens=[1, 2, 3],
+        response_length=2,
+    )
+    student_tokenizer = BoundaryAwareTokenizer(
+        token_map={1: "PROMPT", 2: "A", 3: "B"},
+        encode_map={"PROMPT": [1], "AB": [2, 3], "PROMPTAB": [1, 2, 3]},
+    )
+
+    prompt_text, response_text, full_text = _build_canonical_opd_texts(
+        sample=sample,
+        student_tokenizer=student_tokenizer,
+        prompt_token_ids=[1],
+    )
+
+    assert prompt_text == "PROMPT"
+    assert response_text == "AB"
+    assert full_text == "PROMPTAB"
+
+
+def test_record_student_opd_alignment_uses_token_derived_canonical_text_when_rendered_response_is_not_token_consistent():
+    sample = Sample(
+        prompt="PROMPT",
+        response="bad rendered response",
+        tokens=[1, 2, 3],
+        response_length=2,
+    )
+    student_tokenizer = BoundaryAwareTokenizer(
+        token_map={1: "PROMPT", 2: "A", 3: "B"},
+        encode_map={"PROMPT": [1], "AB": [2, 3], "PROMPTAB": [1, 2, 3]},
+    )
+
+    sample.opd_prompt_text, sample.opd_response_text, sample.opd_full_text = _build_canonical_opd_texts(
+        sample=sample,
+        student_tokenizer=student_tokenizer,
+        prompt_token_ids=[1],
+    )
+    _record_student_opd_alignment(sample, student_tokenizer)
+
+    assert sample.opd_response_text == "AB"
+    assert sample.opd_full_text == "PROMPTAB"
+    assert sample.opd_student_response_bytes == [65, 66]
+    assert sample.opd_student_token_byte_spans == [[0, 1], [1, 2]]
+    assert sample.opd_student_alignment_error is None
+
+
+def test_record_student_opd_alignment_prefers_generation_token_text_evidence(monkeypatch):
+    sample = Sample(
+        tokens=[1, 2, 3],
+        response_length=2,
+        opd_prompt_text="PROMPT",
+        opd_response_text="AB",
+        opd_full_text="PROMPTAB",
+        opd_student_token_texts=["A", "B"],
+    )
+    student_tokenizer = BoundaryAwareTokenizer(
+        token_map={1: "PROMPT", 2: "A", 3: "B"},
+        encode_map={"PROMPTAB": [1, 2, 3], "AB": [2, 3]},
+    )
+
+    monkeypatch.setattr(
+        "slime.rollout.on_policy_distillation.build_recorded_student_response_alignment",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("tokenizer reconstruction should not run")),
+    )
+
+    _record_student_opd_alignment(sample, student_tokenizer)
+
+    assert sample.opd_student_response_bytes == [65, 66]
+    assert sample.opd_student_token_byte_spans == [[0, 1], [1, 2]]
+    assert sample.opd_student_alignment_source == "generation_logprobs_text"
+    assert sample.opd_student_alignment_validated is True
+    assert sample.opd_student_alignment_status == "ok_recorded"
+    assert sample.opd_student_alignment_error is None
+
+
+def test_record_student_opd_alignment_preserves_generation_evidence_failure_context(monkeypatch):
+    sample = Sample(
+        tokens=[1, 2, 3],
+        response_length=2,
+        opd_prompt_text="PROMPT",
+        opd_response_text="AB",
+        opd_full_text="PROMPTAB",
+        opd_student_token_texts=["A", ""],
+    )
+    student_tokenizer = BoundaryAwareTokenizer(
+        token_map={1: "PROMPT", 2: "A", 3: "B"},
+        encode_map={"PROMPTAB": [1, 2, 3], "AB": [2, 3]},
+    )
+
+    monkeypatch.setattr(
+        "slime.rollout.on_policy_distillation.build_recorded_student_response_alignment",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("Tokenizer token/offset reconstruction failed.")),
+    )
+
+    _record_student_opd_alignment(sample, student_tokenizer)
+
+    assert sample.opd_student_alignment_status == "recorded_missing"
+    assert sample.opd_student_alignment_validated is False
+    assert sample.opd_student_alignment_source == "recorded_builder"
+    assert sample.opd_student_alignment_error is not None
+    assert "generation_logprobs_text_failed" in sample.opd_student_alignment_error
+    assert "Generation token texts do not match canonical response text bytes." in sample.opd_student_alignment_error
+    assert "Tokenizer token/offset reconstruction failed." in sample.opd_student_alignment_error
 
 
 def test_apply_opd_byte_chunk_to_advantages(monkeypatch):

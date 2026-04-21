@@ -35,12 +35,15 @@ from slime.utils.types import Sample
 
 
 def test_generate_keeps_rollout_log_probs_aligned_with_response_tokens_when_truncated(monkeypatch):
+    captured_payload = {}
+
     async def fake_post(url, payload, headers=None):
-        del url, payload, headers
+        del url, headers
+        captured_payload.update(payload)
         return {
             "text": "AB",
             "meta_info": {
-                "output_token_logprobs": [[-0.1, 11], [-0.2, 12]],
+                "output_token_logprobs": [[-0.1, 11, "A"], [-0.2, 12, "B"]],
                 "finish_reason": {"type": "length"},
                 "prompt_tokens": 3,
                 "completion_tokens": 2,
@@ -79,8 +82,10 @@ def test_generate_keeps_rollout_log_probs_aligned_with_response_tokens_when_trun
     assert updated.response == "AB"
     assert updated.response_length == 2
     assert updated.rollout_log_probs == [-0.1, -0.2]
+    assert updated.opd_student_token_texts == ["A", "B"]
     assert len(updated.rollout_log_probs) == updated.response_length
     assert updated.tokens[-updated.response_length :] == [11, 12]
+    assert captured_payload["return_text_in_logprobs"] is True
     assert updated.status == Sample.Status.TRUNCATED
 
 

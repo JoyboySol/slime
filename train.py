@@ -1,9 +1,24 @@
+import logging
+
 import ray
 
 from slime.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger, finish_tracking, init_tracking, update_tracking_open_metrics
 from slime.utils.misc import should_run_periodic_action
+
+logger = logging.getLogger(__name__)
+
+
+def _log_driver_rollout_payload(payload):
+    if not payload:
+        return
+    summary_text = payload.get("summary_text")
+    if not summary_text:
+        return
+    kind = payload.get("kind", "unknown")
+    rollout_id = payload.get("rollout_id")
+    logger.info("driver %s opd summary %s: %s", kind, rollout_id, summary_text)
 
 
 def train(args):
@@ -74,7 +89,12 @@ def train(args):
         if args.eval_interval is not None and rollout_id == 0 and not args.skip_eval_before_train:
             ray.get(rollout_manager.eval.remote(rollout_id))
 
-        rollout_data_ref = ray.get(rollout_manager.generate.remote(rollout_id))
+        rollout_result = ray.get(rollout_manager.generate.remote(rollout_id))
+        if isinstance(rollout_result, dict) and "rollout_data" in rollout_result:
+            _log_driver_rollout_payload(rollout_result.get("driver_log_payload"))
+            rollout_data_ref = rollout_result["rollout_data"]
+        else:
+            rollout_data_ref = rollout_result
 
         if args.offload_rollout:
             ray.get(rollout_manager.offload.remote())
@@ -82,10 +102,16 @@ def train(args):
         if args.use_critic:
             critic_train_handle = critic_model.async_train(rollout_id, rollout_data_ref)
             if rollout_id >= args.num_critic_only_steps and not args.critic_train_only:
-                ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
-            ray.get(critic_train_handle)
+                actor_train_result = ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
+                for payload in actor_train_result:
+                    _log_driver_rollout_payload(payload)
+            critic_train_result = ray.get(critic_train_handle)
+            for payload in critic_train_result:
+                _log_driver_rollout_payload(payload)
         else:
-            ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
+            actor_train_result = ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
+            for payload in actor_train_result:
+                _log_driver_rollout_payload(payload)
 
         if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
             save(rollout_id)

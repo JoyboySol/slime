@@ -32,8 +32,12 @@ class Sample:
     opd_response_text: str | None = None  # Canonical response text used by byte_chunk OPD teacher requests
     opd_student_response_bytes: list[int] | bytes | None = None  # Response bytes recorded on the training side
     opd_student_token_byte_spans: list[list[int]] | list[tuple[int, int]] | None = None  # Response token byte spans
+    opd_student_token_texts: list[str] | None = None  # Generation-native response token texts when available
     opd_student_alignment_version: int | str | None = None  # Version marker for recorded student byte alignment
     opd_student_alignment_error: str | None = None  # Structured reason when recorded alignment cannot be trusted
+    opd_student_alignment_source: str | None = None  # Where the recorded student alignment came from
+    opd_student_alignment_validated: bool | None = None  # Whether the recorded student alignment was validated
+    opd_student_alignment_status: str | None = None  # High-level recorded alignment lifecycle status
 
     class Status(Enum):
         PENDING = "pending"

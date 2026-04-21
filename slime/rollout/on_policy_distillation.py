@@ -4,6 +4,7 @@ import torch
 
 from slime.utils.processing_utils import encode_image_for_rollout_engine
 from slime.utils.opd_utils import (
+    build_recorded_student_response_alignment_from_token_texts,
     build_recorded_student_response_alignment,
     build_token_byte_spans,
     clip_token_bytes_by_region,
@@ -16,6 +17,15 @@ from slime.utils.types import Sample
 logger = logging.getLogger(__name__)
 
 
+def _is_text_token_consistent(student_tokenizer, text: str | None, token_ids: list[int]) -> bool:
+    if not isinstance(text, str):
+        return False
+    try:
+        return encode_text(student_tokenizer, text) == token_ids
+    except Exception:
+        return False
+
+
 def _build_canonical_opd_texts(
     *,
     sample: Sample,
@@ -24,10 +34,15 @@ def _build_canonical_opd_texts(
 ) -> tuple[str, str, str]:
     """Build canonical prompt/response/full texts for byte_chunk OPD.
 
-    Prefer rendered prompt and generated response strings, because they preserve
-    chat-template punctuation and spacing exactly. Fall back to token decode
-    only when those strings are unavailable.
+    Prefer rendered prompt / full strings to preserve chat-template punctuation
+    and teacher-facing request text. For response text, require token
+    consistency; if the rendered response drifts from the sampled token ids,
+    fall back to token-derived response text so recorded student alignment
+    remains stable on long cross-tokenizer samples.
     """
+
+    response_token_ids = sample.tokens[len(prompt_token_ids) :]
+    decoded_response_text = decode_token_ids(student_tokenizer, response_token_ids)
 
     prompt_text = sample.opd_prompt_text
     if prompt_text is None:
@@ -36,13 +51,17 @@ def _build_canonical_opd_texts(
         else:
             prompt_text = decode_token_ids(student_tokenizer, prompt_token_ids)
 
-    response_text = sample.opd_response_text if sample.opd_response_text is not None else sample.response
+    rendered_response_text = sample.opd_response_text if sample.opd_response_text is not None else sample.response
+    response_text = (
+        rendered_response_text
+        if _is_text_token_consistent(student_tokenizer, rendered_response_text, response_token_ids)
+        else decoded_response_text
+    )
 
     full_text = sample.opd_full_text
     if full_text is None:
-        if isinstance(prompt_text, str) and isinstance(response_text, str):
-            full_text = prompt_text + response_text
-        else:
+        full_text = f"{prompt_text}{response_text}"
+        if not _is_text_token_consistent(student_tokenizer, full_text, sample.tokens):
             full_text = decode_token_ids(student_tokenizer, sample.tokens)
 
     return prompt_text, response_text, full_text
@@ -182,29 +201,70 @@ def _record_student_opd_alignment(sample: Sample, student_tokenizer) -> None:
         sample.opd_student_token_byte_spans = []
         sample.opd_student_alignment_version = 1
         sample.opd_student_alignment_error = None
+        sample.opd_student_alignment_source = "recorded_builder"
+        sample.opd_student_alignment_validated = True
+        sample.opd_student_alignment_status = "ok_recorded"
         return
 
     if sample.opd_response_text is None:
         raise ValueError("Canonical OPD response text must be set before recording student alignment.")
 
     try:
-        response_bytes, response_spans = build_recorded_student_response_alignment(
-            student_tokenizer,
-            full_token_ids=sample.tokens,
-            prompt_token_count=len(sample.tokens) - sample.response_length,
-            prompt_text=sample.opd_prompt_text or "",
-            response_text=sample.opd_response_text,
-            full_text=sample.opd_full_text,
-        )
+        alignment_source = "recorded_builder"
+        generation_token_text_error: str | None = None
+        if sample.opd_student_token_texts is not None:
+            if len(sample.opd_student_token_texts) != sample.response_length:
+                generation_token_text_error = (
+                    "generation_logprobs_text_failed: "
+                    "Generation token text count does not match response length: "
+                    f"{len(sample.opd_student_token_texts)} vs {sample.response_length}"
+                )
+            else:
+                try:
+                    response_bytes, response_spans = build_recorded_student_response_alignment_from_token_texts(
+                        response_text=sample.opd_response_text,
+                        response_token_texts=sample.opd_student_token_texts,
+                    )
+                    alignment_source = "generation_logprobs_text"
+                except Exception as exc:
+                    generation_token_text_error = f"generation_logprobs_text_failed: {exc}"
+
+            if generation_token_text_error is not None:
+                response_bytes, response_spans = build_recorded_student_response_alignment(
+                    student_tokenizer,
+                    full_token_ids=sample.tokens,
+                    prompt_token_count=len(sample.tokens) - sample.response_length,
+                    prompt_text=sample.opd_prompt_text or "",
+                    response_text=sample.opd_response_text,
+                    full_text=sample.opd_full_text,
+                )
+        else:
+            response_bytes, response_spans = build_recorded_student_response_alignment(
+                student_tokenizer,
+                full_token_ids=sample.tokens,
+                prompt_token_count=len(sample.tokens) - sample.response_length,
+                prompt_text=sample.opd_prompt_text or "",
+                response_text=sample.opd_response_text,
+                full_text=sample.opd_full_text,
+            )
         sample.opd_student_response_bytes = list(response_bytes)
         sample.opd_student_token_byte_spans = [list(span) for span in response_spans]
         sample.opd_student_alignment_version = 1
         sample.opd_student_alignment_error = None
+        sample.opd_student_alignment_source = alignment_source
+        sample.opd_student_alignment_validated = True
+        sample.opd_student_alignment_status = "ok_recorded"
     except Exception as exc:
         sample.opd_student_response_bytes = None
         sample.opd_student_token_byte_spans = None
         sample.opd_student_alignment_version = 1
-        sample.opd_student_alignment_error = str(exc)
+        if "generation_token_text_error" in locals() and generation_token_text_error is not None:
+            sample.opd_student_alignment_error = f"{generation_token_text_error}; tokenizer_reconstruction_failed: {exc}"
+        else:
+            sample.opd_student_alignment_error = str(exc)
+        sample.opd_student_alignment_source = "recorded_builder"
+        sample.opd_student_alignment_validated = False
+        sample.opd_student_alignment_status = "recorded_missing"
 
 
 def compute_teacher_log_probs_for_sample(args, sample: Sample) -> torch.Tensor:

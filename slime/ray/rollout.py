@@ -24,6 +24,7 @@ from slime.utils.http_utils import _wrap_ipv6, find_available_port, get_host_inf
 from slime.utils.logging_utils import configure_logger, init_tracking
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step, compute_statistics, dict_add_prefix
 from slime.utils.misc import Box, group_by, load_function, should_run_periodic_action
+from slime.utils.opd_metric_utils import summarize_opd_alignment_from_samples
 from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from slime.utils.types import Sample
 
@@ -34,6 +35,13 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+
+def _build_opd_rollout_summary(rollout_id: int, samples: list[Sample]) -> tuple[dict[str, float], str | None]:
+    metrics, summary_text = summarize_opd_alignment_from_samples(samples)
+    if summary_text is not None:
+        logger.info("opd rollout summary %s: %s", rollout_id, summary_text)
+    return metrics, summary_text
 
 
 def _should_save_debug_rollout_data(args, rollout_id: int, evaluation: bool) -> bool:
@@ -501,12 +509,15 @@ class RolloutManager:
             self._try_ci_fault_injection()
         data, metrics = self._get_rollout_data(rollout_id=rollout_id)
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=False)
-        _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
+        driver_log_payload = _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
         if self.args.debug_rollout_only:
             # if debug rollout only, we don't convert samples to train data and directly return
-            return
+            return {"rollout_data": None, "driver_log_payload": driver_log_payload}
         data = self._convert_samples_to_train_data(data)
-        return self._split_train_data_by_dp(data, self.train_parallel_config["dp_size"])
+        return {
+            "rollout_data": self._split_train_data_by_dp(data, self.train_parallel_config["dp_size"]),
+            "driver_log_payload": driver_log_payload,
+        }
 
     def eval(self, rollout_id):
         if self.args.debug_train_only:
@@ -780,6 +791,18 @@ class RolloutManager:
         if any(sample.opd_student_token_byte_spans is not None for sample in samples):
             train_data["opd_student_token_byte_spans_list"] = [sample.opd_student_token_byte_spans for sample in samples]
 
+        if any(sample.opd_student_alignment_source is not None for sample in samples):
+            train_data["opd_student_alignment_source_list"] = [sample.opd_student_alignment_source for sample in samples]
+
+        if any(sample.opd_student_alignment_validated is not None for sample in samples):
+            train_data["opd_student_alignment_validated_list"] = [sample.opd_student_alignment_validated for sample in samples]
+
+        if any(sample.opd_student_alignment_status is not None for sample in samples):
+            train_data["opd_student_alignment_status_list"] = [sample.opd_student_alignment_status for sample in samples]
+
+        if any(sample.opd_student_alignment_error is not None for sample in samples):
+            train_data["opd_student_alignment_error_list"] = [sample.opd_student_alignment_error for sample in samples]
+
         return train_data
 
     def set_train_parallel_config(self, config: dict):
@@ -824,6 +847,10 @@ class RolloutManager:
                 "opd_full_texts",
                 "opd_student_response_bytes_list",
                 "opd_student_token_byte_spans_list",
+                "opd_student_alignment_source_list",
+                "opd_student_alignment_validated_list",
+                "opd_student_alignment_status_list",
+                "opd_student_alignment_error_list",
             ]:
                 if key not in data:
                     continue
@@ -1233,10 +1260,13 @@ def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_
     log_dict = {**(rollout_extra_metrics or {})}
     log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), "rollout/")
     log_dict |= dict_add_prefix(compute_perf_metrics_from_samples(args, samples, rollout_time), "perf/")
+    opd_summary_metrics, opd_summary_text = _build_opd_rollout_summary(rollout_id, samples)
+    log_dict |= dict_add_prefix(opd_summary_metrics, "rollout/")
     logger.info(f"perf {rollout_id}: {log_dict}")
     step = compute_rollout_step(args, rollout_id)
     log_dict["rollout/step"] = step
     logging_utils.log(args, log_dict, step_key="rollout/step")
+    return {"kind": "rollout", "rollout_id": rollout_id, "summary_text": opd_summary_text}
 
 
 def compute_metrics_from_samples(args, samples):

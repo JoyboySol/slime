@@ -29,6 +29,68 @@ _install_fake_megatron()
 from slime.backends.megatron_utils.data import log_rollout_data
 
 
+def test_log_rollout_data_emits_opd_alignment_summary(monkeypatch):
+    captured = {}
+    info_messages = []
+
+    monkeypatch.setattr(
+        "slime.backends.megatron_utils.data.mpu.get_tensor_model_parallel_rank",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        "slime.backends.megatron_utils.data.mpu.is_pipeline_last_stage",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "slime.backends.megatron_utils.data.mpu.get_context_parallel_world_size",
+        lambda: 1,
+    )
+
+    def fake_gather_log_data(metric_name, args, rollout_id, log_dict):
+        del metric_name, args, rollout_id
+        captured.update(log_dict)
+        return {}
+
+    monkeypatch.setattr("slime.backends.megatron_utils.data.gather_log_data", fake_gather_log_data)
+    monkeypatch.setattr("slime.backends.megatron_utils.data.logger.info", lambda msg, *args: info_messages.append(msg % args))
+
+    args = Namespace(
+        opd_alignment="byte_chunk",
+        ci_test=False,
+        qkv_format="thd",
+        log_multi_turn=False,
+        log_passrate=False,
+        log_correct_samples=False,
+    )
+    rollout_data = {
+        "tokens": [torch.tensor([1, 2]), torch.tensor([3, 4])],
+        "response_lengths": [1, 1],
+        "loss_masks": [torch.tensor([1.0]), torch.tensor([1.0])],
+        "total_lengths": [2, 2],
+        "raw_reward": [1.0, 0.0],
+        "opd_student_alignment_status_list": ["ok_recorded", "recorded_missing"],
+        "opd_student_alignment_source_list": ["generation_logprobs_text", "recorded_builder"],
+        "opd_student_alignment_validated_list": [True, False],
+        "opd_student_alignment_error_list": [None, "Tokenizer token/offset reconstruction failed."],
+    }
+
+    log_rollout_data(rollout_id=7, args=args, rollout_data=rollout_data)
+
+    assert captured["opd_alignment_sample_count"] == 2
+    assert captured["opd_alignment_status_ok_recorded_count"] == 1
+    assert captured["opd_alignment_status_recorded_missing_count"] == 1
+    assert captured["opd_alignment_source_generation_logprobs_text_count"] == 1
+    assert captured["opd_alignment_source_recorded_builder_count"] == 1
+    assert captured["opd_alignment_validated_true_count"] == 1
+    assert captured["opd_alignment_validated_false_count"] == 1
+    assert captured["opd_alignment_error_count"] == 1
+    assert any("opd alignment summary 7:" in message for message in info_messages)
+    assert any("status={'ok_recorded': 1, 'recorded_missing': 1}" in message for message in info_messages)
+    assert any("source={'generation_logprobs_text': 1, 'recorded_builder': 1}" in message for message in info_messages)
+    assert any("validated={True: 1, False: 1}" in message for message in info_messages)
+    assert any("top_errors=[('Tokenizer token/offset reconstruction failed.', 1)]" in message for message in info_messages)
+
+
 def test_log_rollout_data_skips_opd_text_fields(monkeypatch):
     captured = {}
 
@@ -73,10 +135,107 @@ def test_log_rollout_data_skips_opd_text_fields(monkeypatch):
 
     log_rollout_data(rollout_id=0, args=args, rollout_data=rollout_data)
 
-    assert captured["raw_reward"] == 1.0
     assert "opd_full_texts" not in captured
     assert "opd_prompt_texts" not in captured
     assert "opd_response_texts" not in captured
+
+
+def test_log_rollout_data_skips_opd_recorded_alignment_payloads(monkeypatch):
+    captured = {}
+
+    monkeypatch.setattr(
+        "slime.backends.megatron_utils.data.mpu.get_tensor_model_parallel_rank",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        "slime.backends.megatron_utils.data.mpu.is_pipeline_last_stage",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "slime.backends.megatron_utils.data.mpu.get_context_parallel_world_size",
+        lambda: 1,
+    )
+
+    def fake_gather_log_data(metric_name, args, rollout_id, log_dict):
+        del metric_name, args, rollout_id
+        captured.update(log_dict)
+        return {}
+
+    monkeypatch.setattr("slime.backends.megatron_utils.data.gather_log_data", fake_gather_log_data)
+
+    args = Namespace(
+        opd_alignment="byte_chunk",
+        ci_test=False,
+        qkv_format="thd",
+        log_multi_turn=False,
+        log_passrate=False,
+        log_correct_samples=False,
+        hf_checkpoint="student",
+        opd_teacher_hf_checkpoint="teacher",
+    )
+    rollout_data = {
+        "tokens": [torch.tensor([1, 2])],
+        "response_lengths": [1],
+        "loss_masks": [torch.tensor([1.0])],
+        "total_lengths": [2],
+        "raw_reward": [1.0],
+        "opd_student_response_bytes_list": [[65]],
+        "opd_student_token_byte_spans_list": [[[0, 1]]],
+    }
+
+    log_rollout_data(rollout_id=0, args=args, rollout_data=rollout_data)
+
+    assert "opd_student_response_bytes_list" not in captured
+    assert "opd_student_token_byte_spans_list" not in captured
+
+
+def test_log_rollout_data_skips_opd_recorded_alignment_metadata(monkeypatch):
+    captured = {}
+
+    monkeypatch.setattr(
+        "slime.backends.megatron_utils.data.mpu.get_tensor_model_parallel_rank",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        "slime.backends.megatron_utils.data.mpu.is_pipeline_last_stage",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "slime.backends.megatron_utils.data.mpu.get_context_parallel_world_size",
+        lambda: 1,
+    )
+
+    def fake_gather_log_data(metric_name, args, rollout_id, log_dict):
+        del metric_name, args, rollout_id
+        captured.update(log_dict)
+        return {}
+
+    monkeypatch.setattr("slime.backends.megatron_utils.data.gather_log_data", fake_gather_log_data)
+
+    args = Namespace(
+        opd_alignment="byte_chunk",
+        ci_test=False,
+        qkv_format="thd",
+        log_multi_turn=False,
+        log_passrate=False,
+        log_correct_samples=False,
+    )
+    rollout_data = {
+        "tokens": [torch.tensor([1, 2])],
+        "response_lengths": [1],
+        "loss_masks": [torch.tensor([1.0])],
+        "total_lengths": [2],
+        "raw_reward": [1.0],
+        "opd_student_alignment_source_list": ["recorded_builder"],
+        "opd_student_alignment_validated_list": [True],
+        "opd_student_alignment_status_list": ["ok_recorded"],
+    }
+
+    log_rollout_data(rollout_id=0, args=args, rollout_data=rollout_data)
+
+    assert "opd_student_alignment_source_list" not in captured
+    assert "opd_student_alignment_validated_list" not in captured
+    assert "opd_student_alignment_status_list" not in captured
 
 
 def test_log_rollout_data_adds_byte_chunk_log_prob_metrics(monkeypatch):

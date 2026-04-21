@@ -50,6 +50,9 @@ class AnalysisResult:
     first_diff_student_preview: str | None
     first_diff_teacher_preview: str | None
     response_preview: str
+    recorded_alignment_source: str | None = None
+    recorded_alignment_validated: bool | None = None
+    recorded_alignment_status: str | None = None
 
 
 def discover_input_files(path: Path) -> list[Path]:
@@ -239,6 +242,9 @@ def analyze_row(
         student_response_bytes=len(student_response_bytes),
         teacher_response_bytes=len(teacher_response_bytes),
         student_reconstruction_mode=student_reconstruction_mode,
+        recorded_alignment_source=row.get("opd_student_alignment_source"),
+        recorded_alignment_validated=row.get("opd_student_alignment_validated"),
+        recorded_alignment_status=row.get("opd_student_alignment_status"),
         render_full_matches_decoded=(rendered_full_text == decoded_full_text),
         render_prompt_matches_decoded=(rendered_prompt_text == decoded_prompt_text),
         first_diff_byte=first_diff_byte,

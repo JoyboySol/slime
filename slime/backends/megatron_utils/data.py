@@ -14,6 +14,7 @@ from slime.utils import train_metric_utils
 from slime.utils.data import get_minimum_num_micro_batch_size
 from slime.utils.flops_utils import calculate_fwd_flops
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step
+from slime.utils.opd_metric_utils import summarize_opd_alignment_from_rollout_data
 from slime.utils.opd_utils import compute_byte_chunk_aligned_log_probs, decode_token_ids, get_cached_tokenizer
 from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from slime.utils.types import RolloutBatch
@@ -22,6 +23,15 @@ from ...utils import logging_utils
 from .cp_utils import get_sum_of_sample_mean, slice_with_cp
 
 logger = logging.getLogger(__name__)
+
+
+def _build_opd_alignment_summary_from_rollout_data(
+    rollout_id: int, rollout_data: RolloutBatch
+) -> tuple[dict[str, float], str | None]:
+    metrics, summary_text = summarize_opd_alignment_from_rollout_data(rollout_data)
+    if summary_text is not None:
+        logger.info("opd alignment summary %s: %s", rollout_id, summary_text)
+    return metrics, summary_text
 
 
 def _get_byte_chunk_log_prob_metrics(args: Namespace, rollout_data: RolloutBatch) -> dict[str, float]:
@@ -447,7 +457,7 @@ def log_rollout_data(
     rollout_id: int,
     args: Namespace,
     rollout_data: RolloutBatch,
-) -> None:
+) -> dict[str, str | int | None]:
     """
     Summarize rollout fields and log reduced metrics on PP last stage, TP rank 0.
 
@@ -503,6 +513,12 @@ def log_rollout_data(
                 "opd_full_texts",
                 "opd_prompt_texts",
                 "opd_response_texts",
+                "opd_student_response_bytes_list",
+                "opd_student_token_byte_spans_list",
+                "opd_student_alignment_source_list",
+                "opd_student_alignment_validated_list",
+                "opd_student_alignment_status_list",
+                "opd_student_alignment_error_list",
             ]:
                 continue
             # Upload per sample mean for each rollout value
@@ -547,6 +563,8 @@ def log_rollout_data(
             log_dict[key] = val.item() if isinstance(val, torch.Tensor) else val
 
         log_dict.update(_get_byte_chunk_log_prob_metrics(args, rollout_data))
+        opd_summary_metrics, opd_summary_text = _build_opd_alignment_summary_from_rollout_data(rollout_id, rollout_data)
+        log_dict.update(opd_summary_metrics)
 
         reduced_log_dict = gather_log_data("rollout", args, rollout_id, log_dict)
         if args.ci_test and reduced_log_dict is not None:
@@ -625,6 +643,12 @@ def log_rollout_data(
                 rollout_data["correct_entropy"] = [correct_entropy.item()] * num_correct_responses
             else:
                 rollout_data["correct_entropy"] = [0] * num_correct_responses
+
+    return {
+        "kind": "train",
+        "rollout_id": rollout_id,
+        "summary_text": opd_summary_text if mpu.get_tensor_model_parallel_rank() == 0 and mpu.is_pipeline_last_stage() else None,
+    }
 
 
 def log_multi_turn_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatch) -> None:
