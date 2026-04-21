@@ -507,6 +507,49 @@ def build_recorded_student_response_alignment_from_token_texts(
     return canonical_response_bytes, token_byte_spans
 
 
+def build_generation_byte_evidence_observability(
+    *,
+    response_text: str,
+    response_token_texts: list[str],
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    observability_metadata = dict(metadata or {})
+    observability_metadata.update(
+        {
+            "response_token_count": len(response_token_texts),
+            "generation_token_text_count": len(response_token_texts),
+        }
+    )
+
+    try:
+        response_bytes, _token_byte_spans = build_recorded_student_response_alignment_from_token_texts(
+            response_text=response_text,
+            response_token_texts=response_token_texts,
+        )
+        observability_metadata.update(
+            {
+                "response_byte_length": len(response_bytes),
+                "evidence_kind": "generation_byte_evidence",
+            }
+        )
+        return {
+            "attempted": True,
+            "complete": True,
+            "validated": True,
+            "error": None,
+            "metadata": observability_metadata,
+        }
+    except Exception as exc:
+        observability_metadata["evidence_kind"] = "generation_byte_evidence_invalid"
+        return {
+            "attempted": True,
+            "complete": False,
+            "validated": False,
+            "error": f"generation_byte_evidence_invalid: {exc}",
+            "metadata": observability_metadata,
+        }
+
+
 def build_recorded_student_response_alignment_from_token_ids(
     *,
     tokenizer,
@@ -582,7 +625,7 @@ def compute_byte_chunk_reverse_kl(
     student_alignment_evidence: dict[str, Any] | None = None,
     recorded_student_response_bytes: bytes | bytearray | list[int] | tuple[int, ...] | None = None,
     recorded_student_token_byte_spans: list[tuple[int, int]] | list[list[int]] | None = None,
-    allow_sequence_fallback: bool = True,
+    allow_sequence_fallback: bool = False,
 ) -> torch.Tensor:
     student_chunk_log_probs, teacher_chunk_log_probs = compute_byte_chunk_aligned_log_probs(
         full_text=full_text,
@@ -616,7 +659,7 @@ def compute_byte_chunk_aligned_log_probs(
     student_alignment_evidence: dict[str, Any] | None = None,
     recorded_student_response_bytes: bytes | bytearray | list[int] | tuple[int, ...] | None = None,
     recorded_student_token_byte_spans: list[tuple[int, int]] | list[list[int]] | None = None,
-    allow_sequence_fallback: bool = True,
+    allow_sequence_fallback: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if len(student_token_ids) != prompt_token_count + response_token_count:
         raise ValueError("Student full token ids length does not match prompt/response split.")
@@ -653,29 +696,14 @@ def compute_byte_chunk_aligned_log_probs(
     def _sequence_fallback(
         reason: str, *, student_preview_bytes: list[bytes] | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not allow_sequence_fallback:
-            raise ValueError(
-                "byte_chunk preparation/alignment failure with sequence fallback disabled: "
-                f"{reason}"
+        del student_preview_bytes
+        if allow_sequence_fallback:
+            logger.warning(
+                "Ignoring allow_sequence_fallback=True because cross-tokenizer OPD now requires strict byte-chunk alignment. "
+                "reason=%s",
+                reason,
             )
-        logger.warning(
-            "Falling back to sequence-level OPD penalty after byte_chunk preparation/alignment failure. "
-            "reason=%s prompt_token_count=%s response_token_count=%s prompt_byte_length=%s "
-            "student_token_count=%s teacher_log_prob_count=%s student_preview=%s",
-            reason,
-            prompt_token_count,
-            response_token_count,
-            prompt_byte_length,
-            len(student_token_ids),
-            teacher_log_probs.numel(),
-            _preview(student_tokenizer, response_token_ids, student_preview_bytes or []),
-        )
-        student_sequence_log_prob = student_log_probs.sum() / response_token_count
-        teacher_sequence_log_prob = teacher_log_probs.sum() / response_token_count
-        return (
-            torch.full_like(student_log_probs, student_sequence_log_prob.item()),
-            torch.full_like(student_log_probs, teacher_sequence_log_prob.item()),
-        )
+        raise ValueError(reason)
 
     if student_alignment_evidence is not None:
         if student_alignment_evidence.get("complete") is False:
@@ -732,19 +760,6 @@ def compute_byte_chunk_aligned_log_probs(
     try:
         chunks = align_token_byte_chunks(student_response_bytes, teacher_response_bytes)
     except ValueError as exc:
-        logger.warning(
-            "Falling back to sequence-level OPD penalty after byte_chunk alignment failure. "
-            "prompt_token_count=%s response_token_count=%s prompt_byte_length=%s "
-            "student_token_count=%s teacher_token_count=%s student_preview=%s teacher_preview=%s error=%s",
-            prompt_token_count,
-            response_token_count,
-            prompt_byte_length,
-            len(student_token_ids),
-            len(teacher_token_ids),
-            _preview(student_tokenizer, response_token_ids, student_response_bytes),
-            _preview(teacher_tokenizer, [teacher_token_ids[i] for i in teacher_response_indices], teacher_response_bytes),
-            exc,
-        )
         return _sequence_fallback(f"alignment_failed: {exc}", student_preview_bytes=student_response_bytes)
 
     student_chunk_log_probs = torch.empty_like(student_log_probs)
@@ -757,3 +772,45 @@ def compute_byte_chunk_aligned_log_probs(
         teacher_chunk_log_probs[student_slice] = teacher_chunk_log_prob / student_chunk_length
 
     return student_chunk_log_probs, teacher_chunk_log_probs
+
+
+def prepare_byte_chunk_training_entry(
+    *,
+    full_text: str,
+    prompt_text: str | None,
+    student_token_ids: list[int],
+    response_token_count: int,
+    student_log_probs: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    student_tokenizer,
+    teacher_tokenizer,
+    student_alignment_evidence: dict[str, Any] | None = None,
+    recorded_student_response_bytes: bytes | bytearray | list[int] | tuple[int, ...] | None = None,
+    recorded_student_token_byte_spans: list[tuple[int, int]] | list[list[int]] | None = None,
+) -> dict[str, Any]:
+    prompt_token_count = len(student_token_ids) - response_token_count
+    if prompt_token_count < 0:
+        raise ValueError("Response token count exceeds full student token count.")
+
+    student_chunk_log_probs, teacher_chunk_log_probs = compute_byte_chunk_aligned_log_probs(
+        full_text=full_text,
+        prompt_text=prompt_text,
+        prompt_token_count=prompt_token_count,
+        student_token_ids=student_token_ids,
+        response_token_count=response_token_count,
+        student_log_probs=student_log_probs,
+        teacher_log_probs=teacher_log_probs,
+        student_tokenizer=student_tokenizer,
+        teacher_tokenizer=teacher_tokenizer,
+        student_alignment_evidence=student_alignment_evidence,
+        recorded_student_response_bytes=recorded_student_response_bytes,
+        recorded_student_token_byte_spans=recorded_student_token_byte_spans,
+    )
+    return {
+        "status": "ok",
+        "prompt_token_count": prompt_token_count,
+        "response_token_count": response_token_count,
+        "student_chunk_log_probs": student_chunk_log_probs,
+        "teacher_chunk_log_probs": teacher_chunk_log_probs,
+        "reverse_kl": student_chunk_log_probs - teacher_chunk_log_probs,
+    }

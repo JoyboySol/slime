@@ -84,13 +84,18 @@ def test_generate_keeps_rollout_log_probs_aligned_with_response_tokens_when_trun
     assert updated.response_length == 2
     assert updated.rollout_log_probs == [-0.1, -0.2]
     assert updated.opd_student_token_texts == ["A", "B"]
-    assert updated.opd_student_alignment_version == 2
-    assert updated.opd_student_alignment_source == "generation_byte_evidence"
-    assert updated.opd_student_alignment_complete is True
-    assert updated.opd_student_alignment_validated is True
-    assert updated.opd_student_response_bytes == [65, 66]
-    assert updated.opd_student_token_byte_spans == [[0, 1], [1, 2]]
-    assert updated.opd_student_alignment_metadata == {
+    assert updated.opd_student_alignment_version is None
+    assert updated.opd_student_alignment_source is None
+    assert updated.opd_student_alignment_complete is None
+    assert updated.opd_student_alignment_validated is None
+    assert updated.opd_student_response_bytes is None
+    assert updated.opd_student_token_byte_spans is None
+    assert updated.opd_student_alignment_metadata is None
+    assert updated.opd_generation_byte_evidence_attempted is True
+    assert updated.opd_generation_byte_evidence_complete is True
+    assert updated.opd_generation_byte_evidence_validated is True
+    assert updated.opd_generation_byte_evidence_error is None
+    assert updated.opd_generation_byte_evidence_metadata == {
         "engine": "sglang",
         "detokenizer_protocol": "output_token_logprobs_text",
         "completion_reason": "length",

@@ -12,10 +12,10 @@ from slime.utils.opd_metric_utils import summarize_opd_alignment
 from slime.utils.opd_utils import (
     build_token_byte_spans,
     clip_token_bytes_by_region,
-    compute_byte_chunk_aligned_log_probs,
     encode_text,
     get_generation_byte_evidence_observability,
     get_cached_tokenizer,
+    prepare_byte_chunk_training_entry,
     get_student_alignment_evidence,
 )
 from slime.utils.types import Sample
@@ -72,19 +72,18 @@ def _summarize_sample(sample: Sample, args: argparse.Namespace) -> dict:
             return summary
 
         student_log_probs = torch.tensor(sample.rollout_log_probs, dtype=torch.float32)
-        student_chunk_log_probs, teacher_chunk_log_probs = compute_byte_chunk_aligned_log_probs(
+        entry = prepare_byte_chunk_training_entry(
             full_text=full_text,
             prompt_text=prompt_text,
-            prompt_token_count=len(sample.tokens) - sample.response_length,
             student_token_ids=sample.tokens,
             response_token_count=sample.response_length,
             student_log_probs=student_log_probs,
             teacher_log_probs=teacher_log_probs,
             student_tokenizer=student_tokenizer,
             teacher_tokenizer=teacher_tokenizer,
+            student_alignment_evidence=get_student_alignment_evidence(sample),
             recorded_student_response_bytes=sample.opd_student_response_bytes,
             recorded_student_token_byte_spans=sample.opd_student_token_byte_spans,
-            allow_sequence_fallback=False,
         )
         summary["byte_chunk_alignment"] = "ok"
         summary["student_alignment_source"] = (
@@ -101,8 +100,8 @@ def _summarize_sample(sample: Sample, args: argparse.Namespace) -> dict:
         summary["generation_byte_evidence_complete"] = generation_byte_evidence.get("complete")
         summary["generation_byte_evidence_validated"] = generation_byte_evidence.get("validated")
         summary["generation_byte_evidence_error"] = generation_byte_evidence.get("error")
-        summary["student_chunk_mean"] = float(student_chunk_log_probs.mean().item())
-        summary["teacher_chunk_mean"] = float(teacher_chunk_log_probs.mean().item())
+        summary["student_chunk_mean"] = float(entry["student_chunk_log_probs"].mean().item())
+        summary["teacher_chunk_mean"] = float(entry["teacher_chunk_log_probs"].mean().item())
     except Exception as exc:  # noqa: BLE001
         prompt_text = sample.opd_prompt_text if sample.opd_prompt_text is not None else sample.prompt
         summary = {

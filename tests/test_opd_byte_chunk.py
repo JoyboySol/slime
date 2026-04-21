@@ -531,12 +531,17 @@ def test_replay_summary_prefers_recorded_student_alignment(monkeypatch):
     monkeypatch.setattr(replay_module, "encode_text", lambda _tokenizer, _text: [10, 11])
     monkeypatch.setattr(replay_module, "build_token_byte_spans", fake_build_token_byte_spans)
 
-    def fake_compute_byte_chunk_aligned_log_probs(**kwargs):
+    def fake_prepare_byte_chunk_training_entry(**kwargs):
         assert kwargs["recorded_student_response_bytes"] == [65, 66]
         assert kwargs["recorded_student_token_byte_spans"] == [[0, 1], [1, 2]]
-        return torch.tensor([-0.25, -0.25]), torch.tensor([-0.2, -0.2])
+        return {
+            "status": "ok",
+            "student_chunk_log_probs": torch.tensor([-0.25, -0.25]),
+            "teacher_chunk_log_probs": torch.tensor([-0.2, -0.2]),
+            "reverse_kl": torch.tensor([-0.05, -0.05]),
+        }
 
-    monkeypatch.setattr(replay_module, "compute_byte_chunk_aligned_log_probs", fake_compute_byte_chunk_aligned_log_probs)
+    monkeypatch.setattr(replay_module, "prepare_byte_chunk_training_entry", fake_prepare_byte_chunk_training_entry)
 
     summary = replay_module._summarize_sample(sample, args)
 
@@ -1068,7 +1073,7 @@ def test_compute_byte_chunk_reverse_kl_handles_non_roundtrippable_prompt_tokens(
     assert torch.allclose(reverse_kl, torch.tensor([-0.05, -0.05]))
 
 
-def test_compute_byte_chunk_reverse_kl_uses_contextual_student_response_bytes():
+def test_compute_byte_chunk_reverse_kl_requires_recorded_alignment_when_student_bytes_do_not_chunk_align():
     student_tokenizer = BoundaryAwareTokenizer(
         token_map={1: "P", 2: "A", 3: "B"},
         encode_map={
@@ -1096,21 +1101,20 @@ def test_compute_byte_chunk_reverse_kl_uses_contextual_student_response_bytes():
         offsets_map={"P AB": [(0, 1), (1, 3), (3, 4)]},
     )
 
-    reverse_kl = opd_utils.compute_byte_chunk_reverse_kl(
-        full_text="P AB",
-        prompt_token_count=1,
-        student_token_ids=[1, 2, 3],
-        response_token_count=2,
-        student_log_probs=torch.tensor([-0.2, -0.3]),
-        teacher_log_probs=torch.tensor([-0.4, -0.5]),
-        student_tokenizer=student_tokenizer,
-        teacher_tokenizer=teacher_tokenizer,
-    )
+    with pytest.raises(ValueError, match="alignment_failed"):
+        opd_utils.compute_byte_chunk_reverse_kl(
+            full_text="P AB",
+            prompt_token_count=1,
+            student_token_ids=[1, 2, 3],
+            response_token_count=2,
+            student_log_probs=torch.tensor([-0.2, -0.3]),
+            teacher_log_probs=torch.tensor([-0.4, -0.5]),
+            student_tokenizer=student_tokenizer,
+            teacher_tokenizer=teacher_tokenizer,
+        )
 
-    assert torch.allclose(reverse_kl, torch.tensor([0.2, 0.2]))
 
-
-def test_compute_byte_chunk_reverse_kl_falls_back_to_sequence_penalty_when_alignment_fails(monkeypatch):
+def test_compute_byte_chunk_reverse_kl_raises_when_alignment_fails(monkeypatch):
     student_tokenizer = FakeTokenizer({1: "P", 2: "A", 3: "B"})
     teacher_tokenizer = FakeTokenizer({10: "P", 11: "AB"})
 
@@ -1119,30 +1123,7 @@ def test_compute_byte_chunk_reverse_kl_falls_back_to_sequence_penalty_when_align
 
     monkeypatch.setattr("slime.utils.opd_utils.align_token_byte_chunks", fail_align)
 
-    reverse_kl = opd_utils.compute_byte_chunk_reverse_kl(
-        full_text="PAB",
-        prompt_token_count=1,
-        student_token_ids=[1, 2, 3],
-        response_token_count=2,
-        student_log_probs=torch.tensor([-0.2, -0.3]),
-        teacher_log_probs=torch.tensor([-0.7]),
-        student_tokenizer=student_tokenizer,
-        teacher_tokenizer=teacher_tokenizer,
-    )
-
-    assert torch.allclose(reverse_kl, torch.tensor([0.1, 0.1]))
-
-
-def test_compute_byte_chunk_reverse_kl_raises_when_sequence_fallback_disabled_on_alignment_failure(monkeypatch):
-    student_tokenizer = FakeTokenizer({1: "P", 2: "A", 3: "B"})
-    teacher_tokenizer = FakeTokenizer({10: "P", 11: "AB"})
-
-    def fail_align(_student_token_bytes, _teacher_token_bytes):
-        raise ValueError("forced alignment failure")
-
-    monkeypatch.setattr("slime.utils.opd_utils.align_token_byte_chunks", fail_align)
-
-    with pytest.raises(ValueError, match="sequence fallback disabled"):
+    with pytest.raises(ValueError, match="alignment_failed: forced alignment failure"):
         opd_utils.compute_byte_chunk_reverse_kl(
             full_text="PAB",
             prompt_token_count=1,
@@ -1152,7 +1133,28 @@ def test_compute_byte_chunk_reverse_kl_raises_when_sequence_fallback_disabled_on
             teacher_log_probs=torch.tensor([-0.7]),
             student_tokenizer=student_tokenizer,
             teacher_tokenizer=teacher_tokenizer,
-            allow_sequence_fallback=False,
+        )
+
+
+def test_compute_byte_chunk_reverse_kl_reports_alignment_failure_reason(monkeypatch):
+    student_tokenizer = FakeTokenizer({1: "P", 2: "A", 3: "B"})
+    teacher_tokenizer = FakeTokenizer({10: "P", 11: "AB"})
+
+    def fail_align(_student_token_bytes, _teacher_token_bytes):
+        raise ValueError("forced alignment failure")
+
+    monkeypatch.setattr("slime.utils.opd_utils.align_token_byte_chunks", fail_align)
+
+    with pytest.raises(ValueError, match="alignment_failed: forced alignment failure"):
+        opd_utils.compute_byte_chunk_reverse_kl(
+            full_text="PAB",
+            prompt_token_count=1,
+            student_token_ids=[1, 2, 3],
+            response_token_count=2,
+            student_log_probs=torch.tensor([-0.2, -0.3]),
+            teacher_log_probs=torch.tensor([-0.7]),
+            student_tokenizer=student_tokenizer,
+            teacher_tokenizer=teacher_tokenizer,
         )
 
 
@@ -1184,7 +1186,7 @@ def test_compute_byte_chunk_reverse_kl_falls_back_when_student_byte_reconstructi
     assert torch.allclose(reverse_kl, torch.tensor([0.2, 0.2]))
 
 
-def test_compute_byte_chunk_reverse_kl_raises_when_sequence_fallback_disabled_on_student_failure():
+def test_compute_byte_chunk_reverse_kl_reports_student_reconstruction_failure():
     student_tokenizer = BoundaryAwareTokenizer(
         token_map={1: "P", 2: "A", 3: "X"},
         encode_map={"PAB": [1, 2, 3]},
@@ -1200,7 +1202,7 @@ def test_compute_byte_chunk_reverse_kl_raises_when_sequence_fallback_disabled_on
     teacher_tokenizer = FakeTokenizer({10: "P", 11: "A", 12: "B"})
     student_tokenizer.convert_ids_to_tokens = None
 
-    with pytest.raises(ValueError, match="sequence fallback disabled"):
+    with pytest.raises(ValueError, match="student_byte_reconstruction_failed"):
         opd_utils.compute_byte_chunk_reverse_kl(
             full_text="PAB",
             prompt_token_count=1,
@@ -1210,7 +1212,6 @@ def test_compute_byte_chunk_reverse_kl_raises_when_sequence_fallback_disabled_on
             teacher_log_probs=torch.tensor([-0.4, -0.5]),
             student_tokenizer=student_tokenizer,
             teacher_tokenizer=teacher_tokenizer,
-            allow_sequence_fallback=False,
         )
 
 
@@ -1254,36 +1255,34 @@ def test_compute_byte_chunk_aligned_log_probs_prefers_recorded_student_alignment
     assert torch.allclose(teacher_chunk_log_probs, torch.tensor([-0.2, -0.2]))
 
 
-def test_compute_byte_chunk_aligned_log_probs_treats_incomplete_evidence_as_fallback():
+def test_compute_byte_chunk_aligned_log_probs_rejects_incomplete_evidence_even_when_fallback_flag_is_set():
     student_tokenizer = FakeTokenizer({1: "P", 2: "A", 3: "B"})
     teacher_tokenizer = FakeTokenizer({10: "P", 11: "AB"})
 
-    student_chunk_log_probs, teacher_chunk_log_probs = opd_utils.compute_byte_chunk_aligned_log_probs(
-        full_text="PAB",
-        prompt_text="P",
-        prompt_token_count=1,
-        student_token_ids=[1, 2, 3],
-        response_token_count=2,
-        student_log_probs=torch.tensor([-0.2, -0.3]),
-        teacher_log_probs=torch.tensor([-0.4]),
-        student_tokenizer=student_tokenizer,
-        teacher_tokenizer=teacher_tokenizer,
-        student_alignment_evidence={
-            "version": 2,
-            "source": "generation_byte_evidence",
-            "response_bytes": [65, 66],
-            "token_byte_spans": [[0, 1], [1, 2]],
-            "response_token_count": 2,
-            "complete": False,
-            "validated": True,
-            "error": "generation_byte_evidence_incomplete",
-            "metadata": {"engine": "sglang"},
-        },
-        allow_sequence_fallback=True,
-    )
-
-    assert torch.allclose(student_chunk_log_probs, torch.tensor([-0.25, -0.25]))
-    assert torch.allclose(teacher_chunk_log_probs, torch.tensor([-0.2, -0.2]))
+    with pytest.raises(ValueError, match="student_alignment_evidence_incomplete"):
+        opd_utils.compute_byte_chunk_aligned_log_probs(
+            full_text="PAB",
+            prompt_text="P",
+            prompt_token_count=1,
+            student_token_ids=[1, 2, 3],
+            response_token_count=2,
+            student_log_probs=torch.tensor([-0.2, -0.3]),
+            teacher_log_probs=torch.tensor([-0.4]),
+            student_tokenizer=student_tokenizer,
+            teacher_tokenizer=teacher_tokenizer,
+            student_alignment_evidence={
+                "version": 2,
+                "source": "generation_byte_evidence",
+                "response_bytes": [65, 66],
+                "token_byte_spans": [[0, 1], [1, 2]],
+                "response_token_count": 2,
+                "complete": False,
+                "validated": True,
+                "error": "generation_byte_evidence_incomplete",
+                "metadata": {"engine": "sglang"},
+            },
+            allow_sequence_fallback=True,
+        )
 
 
 def test_record_student_opd_alignment_stores_response_bytes_and_spans():
@@ -1333,10 +1332,6 @@ def test_record_student_opd_alignment_marks_failed_recording_metadata(monkeypatc
         "slime.rollout.on_policy_distillation.build_recorded_student_response_alignment_from_token_ids",
         lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("boom-token-ids")),
     )
-    monkeypatch.setattr(
-        "slime.rollout.on_policy_distillation.build_recorded_student_response_alignment",
-        lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("boom")),
-    )
 
     _record_student_opd_alignment(sample, student_tokenizer)
 
@@ -1346,7 +1341,7 @@ def test_record_student_opd_alignment_marks_failed_recording_metadata(monkeypatc
     assert sample.opd_student_alignment_complete is False
     assert sample.opd_student_alignment_validated is False
     assert sample.opd_student_alignment_status == "recorded_missing"
-    assert sample.opd_student_alignment_error == "boom"
+    assert sample.opd_student_alignment_error == "boom-token-ids"
     assert sample.opd_student_alignment_metadata == {
         "response_token_count": 2,
         "generation_token_text_count": None,
@@ -1371,10 +1366,6 @@ def test_record_student_opd_alignment_prefers_token_id_recorded_builder_before_c
         "slime.rollout.on_policy_distillation.build_recorded_student_response_alignment_from_token_ids",
         lambda **kwargs: (b"AB", [(0, 1), (1, 2)]),
     )
-    monkeypatch.setattr(
-        "slime.rollout.on_policy_distillation.build_recorded_student_response_alignment",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("contextual builder should not run")),
-    )
 
     _record_student_opd_alignment(sample, student_tokenizer)
 
@@ -1388,7 +1379,7 @@ def test_record_student_opd_alignment_prefers_token_id_recorded_builder_before_c
     }
 
 
-def test_record_student_opd_alignment_falls_back_to_contextual_builder_after_token_id_failure(monkeypatch):
+def test_record_student_opd_alignment_marks_failure_when_token_id_builder_fails(monkeypatch):
     sample = Sample(
         tokens=[1, 2, 3],
         response_length=2,
@@ -1408,13 +1399,16 @@ def test_record_student_opd_alignment_falls_back_to_contextual_builder_after_tok
 
     _record_student_opd_alignment(sample, student_tokenizer)
 
-    assert sample.opd_student_response_bytes == [65, 66]
-    assert sample.opd_student_token_byte_spans == [[0, 1], [1, 2]]
+    assert sample.opd_student_response_bytes is None
+    assert sample.opd_student_token_byte_spans is None
     assert sample.opd_student_alignment_source == "recorded_builder"
+    assert sample.opd_student_alignment_complete is False
+    assert sample.opd_student_alignment_validated is False
+    assert sample.opd_student_alignment_error == "token-id failed"
     assert sample.opd_student_alignment_metadata == {
         "response_token_count": 2,
-        "response_byte_length": 2,
-        "evidence_kind": "recorded_builder_contextual",
+        "generation_token_text_count": None,
+        "evidence_kind": "recorded_builder_failed",
     }
 
 
@@ -1467,7 +1461,7 @@ def test_record_student_opd_alignment_uses_token_derived_canonical_text_when_ren
     assert sample.opd_student_alignment_error is None
 
 
-def test_record_student_opd_alignment_prefers_generation_token_text_evidence(monkeypatch):
+def test_record_student_opd_alignment_ignores_generation_token_text_for_production_alignment(monkeypatch):
     sample = Sample(
         tokens=[1, 2, 3],
         response_length=2,
@@ -1487,16 +1481,11 @@ def test_record_student_opd_alignment_prefers_generation_token_text_evidence(mon
         encode_map={"PROMPTAB": [1, 2, 3], "AB": [2, 3]},
     )
 
-    monkeypatch.setattr(
-        "slime.rollout.on_policy_distillation.build_recorded_student_response_alignment",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("tokenizer reconstruction should not run")),
-    )
-
     _record_student_opd_alignment(sample, student_tokenizer)
 
     assert sample.opd_student_response_bytes == [65, 66]
     assert sample.opd_student_token_byte_spans == [[0, 1], [1, 2]]
-    assert sample.opd_student_alignment_source == "generation_logprobs_text"
+    assert sample.opd_student_alignment_source == "recorded_builder"
     assert sample.opd_student_alignment_complete is True
     assert sample.opd_student_alignment_validated is True
     assert sample.opd_student_alignment_status == "ok_recorded"
@@ -1509,11 +1498,11 @@ def test_record_student_opd_alignment_prefers_generation_token_text_evidence(mon
         "response_token_count": 2,
         "response_byte_length": 2,
         "generation_token_text_count": 2,
-        "evidence_kind": "generation_logprobs_text",
+        "evidence_kind": "recorded_builder_token_ids",
     }
 
 
-def test_record_student_opd_alignment_preserves_complete_generation_byte_evidence(monkeypatch):
+def test_record_student_opd_alignment_rebuilds_clean_recorded_alignment_from_token_ids(monkeypatch):
     sample = Sample(
         tokens=[1, 2, 3],
         response_length=2,
@@ -1538,28 +1527,17 @@ def test_record_student_opd_alignment_preserves_complete_generation_byte_evidenc
         encode_map={"PROMPTAB": [1, 2, 3], "AB": [2, 3]},
     )
 
-    monkeypatch.setattr(
-        "slime.rollout.on_policy_distillation.build_recorded_student_response_alignment_from_token_texts",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("generation token text reconstruction should not run")),
-    )
-    monkeypatch.setattr(
-        "slime.rollout.on_policy_distillation.build_recorded_student_response_alignment",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("tokenizer reconstruction should not run")),
-    )
-
     _record_student_opd_alignment(sample, student_tokenizer)
 
-    assert sample.opd_student_alignment_version == 2
-    assert sample.opd_student_alignment_source == "generation_byte_evidence"
+    assert sample.opd_student_alignment_version == 1
+    assert sample.opd_student_alignment_source == "recorded_builder"
     assert sample.opd_student_alignment_complete is True
     assert sample.opd_student_alignment_validated is True
     assert sample.opd_student_response_bytes == [65, 66]
     assert sample.opd_student_token_byte_spans == [[0, 1], [1, 2]]
 
 
-def test_record_student_opd_alignment_uses_generation_logprobs_text_only_after_invalid_generation_byte_evidence(
-    monkeypatch,
-):
+def test_record_student_opd_alignment_uses_token_id_builder_after_invalid_generation_byte_evidence():
     sample = Sample(
         tokens=[1, 2, 3],
         response_length=2,
@@ -1585,19 +1563,43 @@ def test_record_student_opd_alignment_uses_generation_logprobs_text_only_after_i
         encode_map={"PROMPTAB": [1, 2, 3], "AB": [2, 3]},
     )
 
-    monkeypatch.setattr(
-        "slime.rollout.on_policy_distillation.build_recorded_student_response_alignment",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("tokenizer reconstruction should not run")),
-    )
-
     _record_student_opd_alignment(sample, student_tokenizer)
 
-    assert sample.opd_student_alignment_source == "generation_logprobs_text"
+    assert sample.opd_student_alignment_source == "recorded_builder"
     assert sample.opd_student_alignment_complete is True
     assert sample.opd_student_alignment_validated is True
     assert sample.opd_student_response_bytes == [65, 66]
     assert sample.opd_student_token_byte_spans == [[0, 1], [1, 2]]
-    assert sample.opd_student_alignment_metadata["evidence_kind"] == "generation_logprobs_text"
+    assert sample.opd_student_alignment_metadata["evidence_kind"] == "recorded_builder_token_ids"
+
+
+def test_compute_byte_chunk_aligned_log_probs_raises_by_default_on_incomplete_evidence():
+    student_tokenizer = FakeTokenizer({1: "P", 2: "A", 3: "B"})
+    teacher_tokenizer = FakeTokenizer({10: "P", 11: "AB"})
+
+    with pytest.raises(ValueError, match="student_alignment_evidence_incomplete"):
+        opd_utils.compute_byte_chunk_aligned_log_probs(
+            full_text="PAB",
+            prompt_text="P",
+            prompt_token_count=1,
+            student_token_ids=[1, 2, 3],
+            response_token_count=2,
+            student_log_probs=torch.tensor([-0.2, -0.3]),
+            teacher_log_probs=torch.tensor([-0.4]),
+            student_tokenizer=student_tokenizer,
+            teacher_tokenizer=teacher_tokenizer,
+            student_alignment_evidence={
+                "version": 2,
+                "source": "generation_byte_evidence",
+                "response_bytes": [65, 66],
+                "token_byte_spans": [[0, 1], [1, 2]],
+                "response_token_count": 2,
+                "complete": False,
+                "validated": True,
+                "error": "generation_byte_evidence_incomplete",
+                "metadata": {"engine": "sglang"},
+            },
+        )
 
 
 def test_record_student_opd_alignment_preserves_generation_evidence_failure_context(monkeypatch):
@@ -1618,11 +1620,6 @@ def test_record_student_opd_alignment_preserves_generation_evidence_failure_cont
     student_tokenizer = BoundaryAwareTokenizer(
         token_map={1: "PROMPT", 2: "A", 3: "B"},
         encode_map={"PROMPTAB": [1, 2, 3], "AB": [2, 3]},
-    )
-
-    monkeypatch.setattr(
-        "slime.rollout.on_policy_distillation.build_recorded_student_response_alignment",
-        lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("Tokenizer token/offset reconstruction failed.")),
     )
 
     _record_student_opd_alignment(sample, student_tokenizer)

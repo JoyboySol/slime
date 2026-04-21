@@ -83,7 +83,7 @@ def test_log_rollout_data_accepts_non_scalar_rewards(monkeypatch):
     monkeypatch.setattr(rollout_module.logger, "info", lambda msg, *args: info_messages.append(msg % args))
 
     samples[0].opd_student_alignment_status = "ok_recorded"
-    samples[0].opd_student_alignment_source = "generation_logprobs_text"
+    samples[0].opd_student_alignment_source = "recorded_builder"
     samples[0].opd_student_alignment_complete = True
     samples[0].opd_student_alignment_validated = True
     samples[1].opd_student_alignment_status = "recorded_missing"
@@ -106,8 +106,7 @@ def test_log_rollout_data_accepts_non_scalar_rewards(monkeypatch):
     assert logged["rollout/opd_alignment_sample_count"] == 2
     assert logged["rollout/opd_alignment_status_ok_recorded_count"] == 1
     assert logged["rollout/opd_alignment_status_recorded_missing_count"] == 1
-    assert logged["rollout/opd_alignment_source_generation_logprobs_text_count"] == 1
-    assert logged["rollout/opd_alignment_source_recorded_builder_count"] == 1
+    assert logged["rollout/opd_alignment_source_recorded_builder_count"] == 2
     assert logged["rollout/opd_alignment_complete_true_count"] == 1
     assert logged["rollout/opd_alignment_complete_false_count"] == 1
     assert logged["rollout/opd_alignment_validated_true_count"] == 1
@@ -115,7 +114,7 @@ def test_log_rollout_data_accepts_non_scalar_rewards(monkeypatch):
     assert logged["rollout/opd_alignment_error_count"] == 1
     assert any("opd rollout summary 5:" in message for message in info_messages)
     assert any("status={'ok_recorded': 1, 'recorded_missing': 1}" in message for message in info_messages)
-    assert any("source={'generation_logprobs_text': 1, 'recorded_builder': 1}" in message for message in info_messages)
+    assert any("source={'recorded_builder': 2}" in message for message in info_messages)
     assert any("complete={True: 1, False: 1}" in message for message in info_messages)
     assert any("validated={True: 1, False: 1}" in message for message in info_messages)
 

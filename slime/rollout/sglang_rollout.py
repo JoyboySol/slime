@@ -27,7 +27,7 @@ from slime.utils.processing_utils import (
     load_processor,
     load_tokenizer,
 )
-from slime.utils.opd_utils import build_recorded_student_response_alignment_from_token_texts
+from slime.utils.opd_utils import build_generation_byte_evidence_observability
 from slime.utils.trace_utils import build_sglang_meta_trace_attrs, trace_function, trace_span
 from slime.utils.types import Sample
 
@@ -49,7 +49,7 @@ def _update_generation_byte_evidence(
     if sample.opd_student_token_texts is None:
         return
 
-    alignment_metadata = dict(sample.opd_student_alignment_metadata or {})
+    alignment_metadata = dict(sample.opd_generation_byte_evidence_metadata or {})
     alignment_metadata.update(
         {
             "engine": "sglang",
@@ -58,54 +58,16 @@ def _update_generation_byte_evidence(
             "captured_response_token_count": len(sample.opd_student_token_texts),
         }
     )
-    sample.opd_generation_byte_evidence_attempted = True
-
-    try:
-        response_bytes, token_byte_spans = build_recorded_student_response_alignment_from_token_texts(
-            response_text=sample.response,
-            response_token_texts=sample.opd_student_token_texts,
-        )
-        sample.opd_student_response_bytes = list(response_bytes)
-        sample.opd_student_token_byte_spans = [list(span) for span in token_byte_spans]
-        sample.opd_student_alignment_version = 2
-        sample.opd_student_alignment_source = "generation_byte_evidence"
-        sample.opd_student_alignment_complete = True
-        sample.opd_student_alignment_validated = True
-        sample.opd_student_alignment_status = "ok_recorded"
-        sample.opd_student_alignment_error = None
-        sample.opd_generation_byte_evidence_complete = True
-        sample.opd_generation_byte_evidence_validated = True
-        sample.opd_generation_byte_evidence_error = None
-        alignment_metadata.update(
-            {
-                "response_token_count": sample.response_length,
-                "response_byte_length": len(response_bytes),
-                "generation_token_text_count": len(sample.opd_student_token_texts),
-                "evidence_kind": "generation_byte_evidence",
-            }
-        )
-    except Exception as exc:
-        sample.opd_student_response_bytes = None
-        sample.opd_student_token_byte_spans = None
-        sample.opd_student_alignment_version = 2
-        sample.opd_student_alignment_source = "generation_byte_evidence"
-        sample.opd_student_alignment_complete = False
-        sample.opd_student_alignment_validated = False
-        sample.opd_student_alignment_status = "recorded_missing"
-        sample.opd_student_alignment_error = f"generation_byte_evidence_invalid: {exc}"
-        sample.opd_generation_byte_evidence_complete = False
-        sample.opd_generation_byte_evidence_validated = False
-        sample.opd_generation_byte_evidence_error = f"generation_byte_evidence_invalid: {exc}"
-        alignment_metadata.update(
-            {
-                "response_token_count": sample.response_length,
-                "generation_token_text_count": len(sample.opd_student_token_texts),
-                "evidence_kind": "generation_byte_evidence_invalid",
-            }
-        )
-
-    sample.opd_student_alignment_metadata = alignment_metadata
-    sample.opd_generation_byte_evidence_metadata = dict(alignment_metadata)
+    observability = build_generation_byte_evidence_observability(
+        response_text=sample.response,
+        response_token_texts=sample.opd_student_token_texts,
+        metadata=alignment_metadata,
+    )
+    sample.opd_generation_byte_evidence_attempted = observability["attempted"]
+    sample.opd_generation_byte_evidence_complete = observability["complete"]
+    sample.opd_generation_byte_evidence_validated = observability["validated"]
+    sample.opd_generation_byte_evidence_error = observability["error"]
+    sample.opd_generation_byte_evidence_metadata = dict(observability["metadata"])
 
 
 def _get_eval_reward_for_logging(sample: Sample, reward_key: str | None) -> Any:
