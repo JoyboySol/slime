@@ -79,6 +79,8 @@ def _create_placement_group(num_gpus):
 def create_placement_groups(args):
     """Create placement groups for actor and rollout engines."""
 
+    rollout_gpu_reservation = 0 if getattr(args, "rollout_external", False) else args.rollout_num_gpus
+
     num_gpus = 0
     if args.debug_train_only:
         num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node
@@ -87,7 +89,7 @@ def create_placement_groups(args):
             num_gpus += args.critic_num_nodes * args.critic_num_gpus_per_node
             critic_offset = args.actor_num_nodes * args.actor_num_gpus_per_node
     elif args.debug_rollout_only:
-        num_gpus = args.rollout_num_gpus
+        num_gpus = rollout_gpu_reservation
         rollout_offset = 0
     elif args.colocate:
         num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node
@@ -96,7 +98,7 @@ def create_placement_groups(args):
             num_gpus += args.critic_num_nodes * args.critic_num_gpus_per_node
             critic_offset = args.actor_num_nodes * args.actor_num_gpus_per_node
     else:
-        num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node + args.rollout_num_gpus
+        num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node + rollout_gpu_reservation
         rollout_offset = args.actor_num_nodes * args.actor_num_gpus_per_node
         if args.use_critic:
             num_gpus += args.critic_num_nodes * args.critic_num_gpus_per_node

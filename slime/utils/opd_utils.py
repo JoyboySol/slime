@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from functools import lru_cache
 import logging
+import re
+from typing import Any
 
 import torch
 from transformers.models.gpt2.tokenization_gpt2 import bytes_to_unicode
@@ -10,6 +12,7 @@ from slime.utils.processing_utils import load_tokenizer
 
 logger = logging.getLogger(__name__)
 _BYTE_LEVEL_CHAR_TO_BYTE = {v: k for k, v in bytes_to_unicode().items()}
+_HEX_BYTE_TOKEN_RE = re.compile(r"^<0x([0-9A-Fa-f]{2})>$")
 
 
 @lru_cache(maxsize=8)
@@ -35,6 +38,157 @@ def _coerce_bytes(value: bytes | bytearray | list[int] | tuple[int, ...]) -> byt
     if isinstance(value, bytearray):
         return bytes(value)
     return bytes(value)
+
+
+def _normalize_token_byte_spans(
+    token_byte_spans: list[tuple[int, int]] | list[list[int]] | None,
+) -> list[list[int]] | None:
+    if token_byte_spans is None:
+        return None
+    return [[int(start), int(end)] for start, end in token_byte_spans]
+
+
+def get_student_alignment_evidence(sample_or_row: Any) -> dict[str, Any] | None:
+    response_bytes = getattr(sample_or_row, "opd_student_response_bytes", None)
+    if response_bytes is None and isinstance(sample_or_row, dict):
+        response_bytes = sample_or_row.get("opd_student_response_bytes")
+
+    token_byte_spans = getattr(sample_or_row, "opd_student_token_byte_spans", None)
+    if token_byte_spans is None and isinstance(sample_or_row, dict):
+        token_byte_spans = sample_or_row.get("opd_student_token_byte_spans")
+
+    source = getattr(sample_or_row, "opd_student_alignment_source", None)
+    if source is None and isinstance(sample_or_row, dict):
+        source = sample_or_row.get("opd_student_alignment_source")
+
+    version = getattr(sample_or_row, "opd_student_alignment_version", None)
+    if version is None and isinstance(sample_or_row, dict):
+        version = sample_or_row.get("opd_student_alignment_version")
+
+    validated = getattr(sample_or_row, "opd_student_alignment_validated", None)
+    if validated is None and isinstance(sample_or_row, dict):
+        validated = sample_or_row.get("opd_student_alignment_validated")
+
+    complete = getattr(sample_or_row, "opd_student_alignment_complete", None)
+    if complete is None and isinstance(sample_or_row, dict):
+        complete = sample_or_row.get("opd_student_alignment_complete")
+
+    error = getattr(sample_or_row, "opd_student_alignment_error", None)
+    if error is None and isinstance(sample_or_row, dict):
+        error = sample_or_row.get("opd_student_alignment_error")
+
+    metadata = getattr(sample_or_row, "opd_student_alignment_metadata", None)
+    if metadata is None and isinstance(sample_or_row, dict):
+        metadata = sample_or_row.get("opd_student_alignment_metadata")
+
+    response_token_count = getattr(sample_or_row, "response_length", None)
+    if response_token_count is None and isinstance(sample_or_row, dict):
+        response_token_count = sample_or_row.get("response_length")
+    if metadata is not None and response_token_count is None:
+        response_token_count = metadata.get("response_token_count")
+
+    if (
+        response_bytes is None
+        and token_byte_spans is None
+        and source is None
+        and version is None
+        and complete is None
+        and validated is None
+        and error is None
+        and metadata is None
+    ):
+        return None
+
+    return {
+        "version": version,
+        "source": source,
+        "response_bytes": list(_coerce_bytes(response_bytes)) if response_bytes is not None else None,
+        "token_byte_spans": _normalize_token_byte_spans(token_byte_spans),
+        "response_token_count": response_token_count,
+        "complete": complete,
+        "validated": validated,
+        "error": error,
+        "metadata": dict(metadata) if metadata is not None else None,
+    }
+
+
+def get_generation_byte_evidence_observability(sample_or_row: Any) -> dict[str, Any] | None:
+    attempted = getattr(sample_or_row, "opd_generation_byte_evidence_attempted", None)
+    if attempted is None and isinstance(sample_or_row, dict):
+        attempted = sample_or_row.get("opd_generation_byte_evidence_attempted")
+
+    complete = getattr(sample_or_row, "opd_generation_byte_evidence_complete", None)
+    if complete is None and isinstance(sample_or_row, dict):
+        complete = sample_or_row.get("opd_generation_byte_evidence_complete")
+
+    validated = getattr(sample_or_row, "opd_generation_byte_evidence_validated", None)
+    if validated is None and isinstance(sample_or_row, dict):
+        validated = sample_or_row.get("opd_generation_byte_evidence_validated")
+
+    error = getattr(sample_or_row, "opd_generation_byte_evidence_error", None)
+    if error is None and isinstance(sample_or_row, dict):
+        error = sample_or_row.get("opd_generation_byte_evidence_error")
+
+    metadata = getattr(sample_or_row, "opd_generation_byte_evidence_metadata", None)
+    if metadata is None and isinstance(sample_or_row, dict):
+        metadata = sample_or_row.get("opd_generation_byte_evidence_metadata")
+
+    if attempted is None and complete is None and validated is None and error is None and metadata is None:
+        return None
+
+    return {
+        "attempted": attempted,
+        "complete": complete,
+        "validated": validated,
+        "error": error,
+        "metadata": dict(metadata) if metadata is not None else None,
+    }
+
+
+def get_student_alignment_evidence_from_rollout_data(rollout_data: dict[str, Any], index: int) -> dict[str, Any] | None:
+    def _get_list_value(key: str):
+        values = rollout_data.get(key)
+        if values is None:
+            return None
+        return values[index]
+
+    evidence = {
+        "version": _get_list_value("opd_student_alignment_version_list"),
+        "source": _get_list_value("opd_student_alignment_source_list"),
+        "response_bytes": _get_list_value("opd_student_response_bytes_list"),
+        "token_byte_spans": _get_list_value("opd_student_token_byte_spans_list"),
+        "response_token_count": rollout_data["response_lengths"][index],
+        "complete": _get_list_value("opd_student_alignment_complete_list"),
+        "validated": _get_list_value("opd_student_alignment_validated_list"),
+        "error": _get_list_value("opd_student_alignment_error_list"),
+        "metadata": _get_list_value("opd_student_alignment_metadata_list"),
+    }
+
+    if all(value is None for value in evidence.values()):
+        return None
+    return evidence
+
+
+def get_generation_byte_evidence_observability_from_rollout_data(
+    rollout_data: dict[str, Any], index: int
+) -> dict[str, Any] | None:
+    def _get_list_value(key: str):
+        values = rollout_data.get(key)
+        if values is None:
+            return None
+        return values[index]
+
+    evidence = {
+        "attempted": _get_list_value("opd_generation_byte_evidence_attempted_list"),
+        "complete": _get_list_value("opd_generation_byte_evidence_complete_list"),
+        "validated": _get_list_value("opd_generation_byte_evidence_validated_list"),
+        "error": _get_list_value("opd_generation_byte_evidence_error_list"),
+        "metadata": _get_list_value("opd_generation_byte_evidence_metadata_list"),
+    }
+
+    if all(value is None for value in evidence.values()):
+        return None
+    return evidence
 
 
 def _build_char_to_byte_offsets(text: str) -> list[int]:
@@ -77,6 +231,34 @@ def _token_piece_to_bytes(token_piece: str) -> bytes:
     return bytes(raw)
 
 
+def _token_piece_candidates(token_piece: str) -> list[bytes]:
+    candidates: list[bytes] = []
+
+    hex_match = _HEX_BYTE_TOKEN_RE.match(token_piece)
+    if hex_match is not None:
+        candidates.append(bytes([int(hex_match.group(1), 16)]))
+
+    # SentencePiece-like token surfaces usually want direct UTF-8 bytes, with ▁
+    # representing a visible word-boundary space.
+    candidates.append(token_piece.replace("▁", " ").encode("utf-8"))
+    if token_piece == "▁":
+        # Around special-token boundaries YuLan can surface a standalone ▁ that
+        # does not materialize as a literal space in the rendered text.
+        candidates.append(b"")
+
+    # Preserve compatibility with byte-level token surfaces such as GPT-2 style
+    # unicode-mapped bytes and legacy fallbacks.
+    candidates.append(_token_piece_to_bytes(token_piece))
+
+    deduped: list[bytes] = []
+    seen: set[bytes] = set()
+    for candidate in candidates:
+        if candidate not in seen:
+            deduped.append(candidate)
+            seen.add(candidate)
+    return deduped
+
+
 def _build_token_byte_spans_via_token_strings(
     tokenizer, text: str, token_ids: list[int]
 ) -> tuple[list[bytes], list[tuple[int, int]]]:
@@ -89,14 +271,25 @@ def _build_token_byte_spans_via_token_strings(
 
     token_bytes = []
     token_byte_spans = []
+    target_bytes = text.encode("utf-8")
     byte_offset = 0
-    for token_piece in token_pieces:
-        piece_bytes = _token_piece_to_bytes(token_piece)
+    for index, token_piece in enumerate(token_pieces):
+        remaining = target_bytes[byte_offset:]
+        matching_candidates = [
+            candidate for candidate in _token_piece_candidates(token_piece) if remaining.startswith(candidate)
+        ]
+        if not matching_candidates:
+            raise ValueError(
+                "Tokenizer token strings do not reconstruct the source text. "
+                f"token_index={index} token_piece={token_piece!r} byte_offset={byte_offset}"
+            )
+
+        piece_bytes = matching_candidates[0]
         token_bytes.append(piece_bytes)
         token_byte_spans.append((byte_offset, byte_offset + len(piece_bytes)))
         byte_offset += len(piece_bytes)
 
-    if b"".join(token_bytes) != text.encode("utf-8"):
+    if b"".join(token_bytes) != target_bytes:
         raise ValueError("Tokenizer token strings do not reconstruct the source text.")
     return token_bytes, token_byte_spans
 
@@ -314,6 +507,23 @@ def build_recorded_student_response_alignment_from_token_texts(
     return canonical_response_bytes, token_byte_spans
 
 
+def build_recorded_student_response_alignment_from_token_ids(
+    *,
+    tokenizer,
+    response_text: str,
+    response_token_ids: list[int],
+) -> tuple[bytes, list[tuple[int, int]]]:
+    canonical_response_bytes = response_text.encode("utf-8")
+    token_bytes, token_byte_spans = _build_token_byte_spans_via_token_strings(
+        tokenizer,
+        response_text,
+        response_token_ids,
+    )
+    if b"".join(token_bytes) != canonical_response_bytes:
+        raise ValueError("Tokenizer token strings do not reconstruct the canonical response text.")
+    return canonical_response_bytes, token_byte_spans
+
+
 def build_recorded_student_response_alignment(
     tokenizer,
     *,
@@ -369,6 +579,7 @@ def compute_byte_chunk_reverse_kl(
     teacher_log_probs: torch.Tensor,
     student_tokenizer,
     teacher_tokenizer,
+    student_alignment_evidence: dict[str, Any] | None = None,
     recorded_student_response_bytes: bytes | bytearray | list[int] | tuple[int, ...] | None = None,
     recorded_student_token_byte_spans: list[tuple[int, int]] | list[list[int]] | None = None,
     allow_sequence_fallback: bool = True,
@@ -383,6 +594,7 @@ def compute_byte_chunk_reverse_kl(
         teacher_log_probs=teacher_log_probs,
         student_tokenizer=student_tokenizer,
         teacher_tokenizer=teacher_tokenizer,
+        student_alignment_evidence=student_alignment_evidence,
         recorded_student_response_bytes=recorded_student_response_bytes,
         recorded_student_token_byte_spans=recorded_student_token_byte_spans,
         allow_sequence_fallback=allow_sequence_fallback,
@@ -401,6 +613,7 @@ def compute_byte_chunk_aligned_log_probs(
     teacher_log_probs: torch.Tensor,
     student_tokenizer,
     teacher_tokenizer,
+    student_alignment_evidence: dict[str, Any] | None = None,
     recorded_student_response_bytes: bytes | bytearray | list[int] | tuple[int, ...] | None = None,
     recorded_student_token_byte_spans: list[tuple[int, int]] | list[list[int]] | None = None,
     allow_sequence_fallback: bool = True,
@@ -463,6 +676,18 @@ def compute_byte_chunk_aligned_log_probs(
             torch.full_like(student_log_probs, student_sequence_log_prob.item()),
             torch.full_like(student_log_probs, teacher_sequence_log_prob.item()),
         )
+
+    if student_alignment_evidence is not None:
+        if student_alignment_evidence.get("complete") is False:
+            return _sequence_fallback(
+                f"student_alignment_evidence_incomplete: {student_alignment_evidence.get('error') or 'complete=False'}"
+            )
+        if student_alignment_evidence.get("validated") is False:
+            return _sequence_fallback(
+                f"student_alignment_evidence_invalid: {student_alignment_evidence.get('error') or 'validated=False'}"
+            )
+        recorded_student_response_bytes = student_alignment_evidence.get("response_bytes")
+        recorded_student_token_byte_spans = student_alignment_evidence.get("token_byte_spans")
 
     if recorded_student_response_bytes is not None or recorded_student_token_byte_spans is not None:
         if recorded_student_response_bytes is None or recorded_student_token_byte_spans is None:

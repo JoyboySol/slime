@@ -69,26 +69,117 @@ def test_log_rollout_data_emits_opd_alignment_summary(monkeypatch):
         "total_lengths": [2, 2],
         "raw_reward": [1.0, 0.0],
         "opd_student_alignment_status_list": ["ok_recorded", "recorded_missing"],
-        "opd_student_alignment_source_list": ["generation_logprobs_text", "recorded_builder"],
-        "opd_student_alignment_validated_list": [True, False],
+        "opd_student_alignment_complete_list": [True, False, True],
+        "opd_student_alignment_source_list": ["generation_byte_evidence", "generation_byte_evidence", "recorded_builder"],
+        "opd_student_alignment_validated_list": [True, False, True],
         "opd_student_alignment_error_list": [None, "Tokenizer token/offset reconstruction failed."],
+        "opd_generation_byte_evidence_attempted_list": [True, True, False],
+        "opd_generation_byte_evidence_complete_list": [True, False, None],
+        "opd_generation_byte_evidence_validated_list": [True, False, None],
+        "opd_student_alignment_metadata_list": [
+            {"evidence_kind": "generation_byte_evidence"},
+            {"evidence_kind": "generation_byte_evidence_invalid"},
+            {"evidence_kind": "recorded_builder_token_ids"},
+        ],
     }
 
     log_rollout_data(rollout_id=7, args=args, rollout_data=rollout_data)
 
-    assert captured["opd_alignment_sample_count"] == 2
+    assert captured["opd_alignment_sample_count"] == 3
     assert captured["opd_alignment_status_ok_recorded_count"] == 1
     assert captured["opd_alignment_status_recorded_missing_count"] == 1
-    assert captured["opd_alignment_source_generation_logprobs_text_count"] == 1
+    assert captured["opd_alignment_source_generation_byte_evidence_count"] == 2
     assert captured["opd_alignment_source_recorded_builder_count"] == 1
-    assert captured["opd_alignment_validated_true_count"] == 1
+    assert captured["opd_alignment_complete_true_count"] == 2
+    assert captured["opd_alignment_complete_false_count"] == 1
+    assert captured["opd_alignment_validated_true_count"] == 2
     assert captured["opd_alignment_validated_false_count"] == 1
     assert captured["opd_alignment_error_count"] == 1
+    assert captured["opd_generation_byte_evidence_hit_count"] == 2
+    assert captured["opd_generation_byte_evidence_hit_rate"] == 2 / 3
+    assert captured["opd_generation_byte_evidence_incomplete_count"] == 1
+    assert captured["opd_generation_byte_evidence_incomplete_rate"] == 0.5
+    assert captured["opd_generation_byte_evidence_invalid_count"] == 1
+    assert captured["opd_generation_byte_evidence_invalid_rate"] == 0.5
+    assert captured["opd_alignment_evidence_kind_generation_byte_evidence_count"] == 1
+    assert captured["opd_alignment_evidence_kind_generation_byte_evidence_invalid_count"] == 1
+    assert captured["opd_alignment_evidence_kind_recorded_builder_token_ids_count"] == 1
     assert any("opd alignment summary 7:" in message for message in info_messages)
     assert any("status={'ok_recorded': 1, 'recorded_missing': 1}" in message for message in info_messages)
-    assert any("source={'generation_logprobs_text': 1, 'recorded_builder': 1}" in message for message in info_messages)
-    assert any("validated={True: 1, False: 1}" in message for message in info_messages)
+    assert any("source={'generation_byte_evidence': 2, 'recorded_builder': 1}" in message for message in info_messages)
+    assert any("evidence_kind={'generation_byte_evidence': 1, 'generation_byte_evidence_invalid': 1, 'recorded_builder_token_ids': 1}" in message for message in info_messages)
+    assert any("generation_byte_evidence={hit_rate=0.6667, incomplete_rate=0.5000, invalid_rate=0.5000}" in message for message in info_messages)
     assert any("top_errors=[('Tokenizer token/offset reconstruction failed.', 1)]" in message for message in info_messages)
+
+
+def test_log_rollout_data_counts_generation_byte_evidence_attempts_separately_from_final_source(monkeypatch):
+    captured = {}
+    info_messages = []
+
+    monkeypatch.setattr(
+        "slime.backends.megatron_utils.data.mpu.get_tensor_model_parallel_rank",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        "slime.backends.megatron_utils.data.mpu.is_pipeline_last_stage",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "slime.backends.megatron_utils.data.mpu.get_context_parallel_world_size",
+        lambda: 1,
+    )
+
+    def fake_gather_log_data(metric_name, args, rollout_id, log_dict):
+        del metric_name, args, rollout_id
+        captured.update(log_dict)
+        return {}
+
+    monkeypatch.setattr("slime.backends.megatron_utils.data.gather_log_data", fake_gather_log_data)
+    monkeypatch.setattr("slime.backends.megatron_utils.data.logger.info", lambda msg, *args: info_messages.append(msg % args))
+
+    args = Namespace(
+        opd_alignment="byte_chunk",
+        ci_test=False,
+        qkv_format="thd",
+        log_multi_turn=False,
+        log_passrate=False,
+        log_correct_samples=False,
+    )
+    rollout_data = {
+        "tokens": [torch.tensor([1, 2]), torch.tensor([3, 4])],
+        "response_lengths": [1, 1],
+        "loss_masks": [torch.tensor([1.0]), torch.tensor([1.0])],
+        "total_lengths": [2, 2],
+        "raw_reward": [1.0, 0.0],
+        "opd_student_alignment_status_list": ["ok_recorded", "ok_recorded"],
+        "opd_student_alignment_complete_list": [True, True],
+        "opd_student_alignment_source_list": ["recorded_builder", "recorded_builder"],
+        "opd_student_alignment_validated_list": [True, True],
+        "opd_student_alignment_error_list": [None, None],
+        "opd_generation_byte_evidence_attempted_list": [True, False],
+        "opd_generation_byte_evidence_complete_list": [False, None],
+        "opd_generation_byte_evidence_validated_list": [False, None],
+        "opd_student_alignment_metadata_list": [
+            {"evidence_kind": "generation_byte_evidence_invalid"},
+            {"evidence_kind": "recorded_builder_contextual"},
+        ],
+    }
+
+    log_rollout_data(rollout_id=8, args=args, rollout_data=rollout_data)
+
+    assert captured["opd_alignment_source_recorded_builder_count"] == 2
+    assert captured["opd_generation_byte_evidence_sample_count"] == 1
+    assert captured["opd_generation_byte_evidence_hit_count"] == 1
+    assert captured["opd_generation_byte_evidence_hit_rate"] == 0.5
+    assert captured["opd_generation_byte_evidence_incomplete_count"] == 1
+    assert captured["opd_generation_byte_evidence_incomplete_rate"] == 1.0
+    assert captured["opd_generation_byte_evidence_invalid_count"] == 1
+    assert captured["opd_generation_byte_evidence_invalid_rate"] == 1.0
+    assert captured["opd_alignment_evidence_kind_generation_byte_evidence_invalid_count"] == 1
+    assert captured["opd_alignment_evidence_kind_recorded_builder_contextual_count"] == 1
+    assert any("source={'recorded_builder': 2}" in message for message in info_messages)
+    assert any("evidence_kind={'generation_byte_evidence_invalid': 1, 'recorded_builder_contextual': 1}" in message for message in info_messages)
+    assert any("generation_byte_evidence={hit_rate=0.5000, incomplete_rate=1.0000, invalid_rate=1.0000}" in message for message in info_messages)
 
 
 def test_log_rollout_data_skips_opd_text_fields(monkeypatch):
@@ -227,6 +318,7 @@ def test_log_rollout_data_skips_opd_recorded_alignment_metadata(monkeypatch):
         "total_lengths": [2],
         "raw_reward": [1.0],
         "opd_student_alignment_source_list": ["recorded_builder"],
+        "opd_student_alignment_complete_list": [True],
         "opd_student_alignment_validated_list": [True],
         "opd_student_alignment_status_list": ["ok_recorded"],
     }
@@ -234,6 +326,7 @@ def test_log_rollout_data_skips_opd_recorded_alignment_metadata(monkeypatch):
     log_rollout_data(rollout_id=0, args=args, rollout_data=rollout_data)
 
     assert "opd_student_alignment_source_list" not in captured
+    assert "opd_student_alignment_complete_list" not in captured
     assert "opd_student_alignment_validated_list" not in captured
     assert "opd_student_alignment_status_list" not in captured
 
@@ -336,3 +429,78 @@ def test_log_rollout_data_adds_byte_chunk_log_prob_metrics(monkeypatch):
 
     assert abs(captured["rollout_chunk_log_prob"] - (-0.2)) < 1e-6
     assert abs(captured["teacher_chunk_log_prob"] - (-0.5 / 3.0)) < 1e-6
+
+
+def test_log_rollout_data_passes_student_alignment_evidence_to_byte_chunk_metrics(monkeypatch):
+    captured = {}
+
+    monkeypatch.setattr(
+        "slime.backends.megatron_utils.data.mpu.get_tensor_model_parallel_rank",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        "slime.backends.megatron_utils.data.mpu.is_pipeline_last_stage",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "slime.backends.megatron_utils.data.mpu.get_context_parallel_world_size",
+        lambda: 1,
+    )
+
+    monkeypatch.setattr("slime.backends.megatron_utils.data.get_cached_tokenizer", lambda _path: object())
+
+    def fake_gather_log_data(metric_name, args, rollout_id, log_dict):
+        del metric_name, args, rollout_id
+        captured.update(log_dict)
+        return {}
+
+    def fake_compute_byte_chunk_aligned_log_probs(**kwargs):
+        assert kwargs["student_alignment_evidence"] == {
+            "version": 2,
+            "source": "generation_byte_evidence",
+            "response_bytes": [65, 66],
+            "token_byte_spans": [[0, 1], [1, 2]],
+            "response_token_count": 2,
+            "complete": True,
+            "validated": True,
+            "error": None,
+            "metadata": {"engine": "sglang"},
+        }
+        return torch.tensor([-0.25, -0.25]), torch.tensor([-0.2, -0.2])
+
+    monkeypatch.setattr("slime.backends.megatron_utils.data.compute_byte_chunk_aligned_log_probs", fake_compute_byte_chunk_aligned_log_probs)
+    monkeypatch.setattr("slime.backends.megatron_utils.data.gather_log_data", fake_gather_log_data)
+
+    args = Namespace(
+        opd_alignment="byte_chunk",
+        ci_test=False,
+        qkv_format="thd",
+        log_multi_turn=False,
+        log_passrate=False,
+        log_correct_samples=False,
+        hf_checkpoint="student",
+        opd_teacher_hf_checkpoint="teacher",
+    )
+    rollout_data = {
+        "tokens": [torch.tensor([1, 2, 3])],
+        "response_lengths": [2],
+        "loss_masks": [torch.tensor([1.0, 1.0])],
+        "total_lengths": [3],
+        "rollout_log_probs": [torch.tensor([-0.2, -0.3])],
+        "teacher_log_probs": [torch.tensor([-0.4])],
+        "opd_full_texts": ["PAB"],
+        "opd_prompt_texts": ["P"],
+        "opd_student_response_bytes_list": [[65, 66]],
+        "opd_student_token_byte_spans_list": [[[0, 1], [1, 2]]],
+        "opd_student_alignment_version_list": [2],
+        "opd_student_alignment_source_list": ["generation_byte_evidence"],
+        "opd_student_alignment_complete_list": [True],
+        "opd_student_alignment_validated_list": [True],
+        "opd_student_alignment_error_list": [None],
+        "opd_student_alignment_metadata_list": [{"engine": "sglang"}],
+    }
+
+    log_rollout_data(rollout_id=0, args=args, rollout_data=rollout_data)
+
+    assert abs(captured["rollout_chunk_log_prob"] - (-0.25)) < 1e-6
+    assert abs(captured["teacher_chunk_log_prob"] - (-0.2)) < 1e-6

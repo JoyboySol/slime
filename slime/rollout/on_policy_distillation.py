@@ -5,12 +5,14 @@ import torch
 from slime.utils.processing_utils import encode_image_for_rollout_engine
 from slime.utils.opd_utils import (
     build_recorded_student_response_alignment_from_token_texts,
+    build_recorded_student_response_alignment_from_token_ids,
     build_recorded_student_response_alignment,
     build_token_byte_spans,
     clip_token_bytes_by_region,
     decode_token_ids,
     encode_text,
     get_cached_tokenizer,
+    validate_recorded_student_response_alignment,
 )
 from slime.utils.types import Sample
 
@@ -196,6 +198,9 @@ def _align_teacher_reward_log_probs(
 
 
 def _record_student_opd_alignment(sample: Sample, student_tokenizer) -> None:
+    base_alignment_metadata = dict(sample.opd_student_alignment_metadata or {})
+    generation_byte_evidence_metadata = dict(sample.opd_generation_byte_evidence_metadata or base_alignment_metadata)
+
     if sample.response_length <= 0:
         sample.opd_student_response_bytes = []
         sample.opd_student_token_byte_spans = []
@@ -204,14 +209,67 @@ def _record_student_opd_alignment(sample: Sample, student_tokenizer) -> None:
         sample.opd_student_alignment_source = "recorded_builder"
         sample.opd_student_alignment_validated = True
         sample.opd_student_alignment_status = "ok_recorded"
+        sample.opd_student_alignment_complete = True
+        sample.opd_student_alignment_metadata = base_alignment_metadata | {
+            "response_token_count": 0,
+            "response_byte_length": 0,
+            "generation_token_text_count": len(sample.opd_student_token_texts)
+            if sample.opd_student_token_texts is not None
+            else None,
+            "evidence_kind": "empty_response",
+        }
+        if sample.opd_generation_byte_evidence_attempted is None:
+            sample.opd_generation_byte_evidence_attempted = False
         return
 
     if sample.opd_response_text is None:
         raise ValueError("Canonical OPD response text must be set before recording student alignment.")
 
+    if (
+        sample.opd_student_alignment_source == "generation_byte_evidence"
+        and sample.opd_student_alignment_complete is True
+        and sample.opd_student_alignment_validated is True
+        and sample.opd_student_response_bytes is not None
+        and sample.opd_student_token_byte_spans is not None
+    ):
+        response_bytes, response_spans = validate_recorded_student_response_alignment(
+            response_text=sample.opd_response_text,
+            response_token_count=sample.response_length,
+            response_bytes=sample.opd_student_response_bytes,
+            token_byte_spans=sample.opd_student_token_byte_spans,
+        )
+        sample.opd_student_response_bytes = list(b"".join(response_bytes))
+        sample.opd_student_token_byte_spans = [list(span) for span in response_spans]
+        sample.opd_student_alignment_version = 2
+        sample.opd_student_alignment_error = None
+        sample.opd_student_alignment_status = "ok_recorded"
+        sample.opd_student_alignment_metadata = base_alignment_metadata | {
+            "response_token_count": sample.response_length,
+            "response_byte_length": len(b"".join(response_bytes)),
+            "generation_token_text_count": len(sample.opd_student_token_texts)
+            if sample.opd_student_token_texts is not None
+            else base_alignment_metadata.get("generation_token_text_count"),
+            "evidence_kind": "generation_byte_evidence",
+        }
+        sample.opd_generation_byte_evidence_attempted = True
+        sample.opd_generation_byte_evidence_complete = True
+        sample.opd_generation_byte_evidence_validated = True
+        sample.opd_generation_byte_evidence_error = None
+        sample.opd_generation_byte_evidence_metadata = generation_byte_evidence_metadata | {
+            "response_token_count": sample.response_length,
+            "response_byte_length": len(b"".join(response_bytes)),
+            "generation_token_text_count": len(sample.opd_student_token_texts)
+            if sample.opd_student_token_texts is not None
+            else generation_byte_evidence_metadata.get("generation_token_text_count"),
+            "evidence_kind": "generation_byte_evidence",
+        }
+        return
+
     try:
         alignment_source = "recorded_builder"
+        evidence_kind = "recorded_builder_contextual"
         generation_token_text_error: str | None = None
+        generation_token_text_count = len(sample.opd_student_token_texts) if sample.opd_student_token_texts is not None else None
         if sample.opd_student_token_texts is not None:
             if len(sample.opd_student_token_texts) != sample.response_length:
                 generation_token_text_error = (
@@ -226,10 +284,63 @@ def _record_student_opd_alignment(sample: Sample, student_tokenizer) -> None:
                         response_token_texts=sample.opd_student_token_texts,
                     )
                     alignment_source = "generation_logprobs_text"
+                    evidence_kind = "generation_logprobs_text"
                 except Exception as exc:
                     generation_token_text_error = f"generation_logprobs_text_failed: {exc}"
 
             if generation_token_text_error is not None:
+                sample.opd_generation_byte_evidence_attempted = True
+                sample.opd_generation_byte_evidence_complete = False
+                sample.opd_generation_byte_evidence_validated = False
+                sample.opd_generation_byte_evidence_error = (
+                    generation_token_text_error.removeprefix("generation_logprobs_text_failed: ").strip()
+                )
+                sample.opd_generation_byte_evidence_error = (
+                    f"generation_byte_evidence_invalid: {sample.opd_generation_byte_evidence_error}"
+                )
+                sample.opd_generation_byte_evidence_metadata = generation_byte_evidence_metadata | {
+                    "response_token_count": sample.response_length,
+                    "generation_token_text_count": generation_token_text_count,
+                    "evidence_kind": "generation_byte_evidence_invalid",
+                }
+                try:
+                    response_bytes, response_spans = build_recorded_student_response_alignment_from_token_ids(
+                        tokenizer=student_tokenizer,
+                        response_text=sample.opd_response_text,
+                        response_token_ids=sample.tokens[-sample.response_length :],
+                    )
+                    evidence_kind = "recorded_builder_token_ids"
+                except Exception:
+                    response_bytes, response_spans = build_recorded_student_response_alignment(
+                        student_tokenizer,
+                        full_token_ids=sample.tokens,
+                        prompt_token_count=len(sample.tokens) - sample.response_length,
+                        prompt_text=sample.opd_prompt_text or "",
+                        response_text=sample.opd_response_text,
+                        full_text=sample.opd_full_text,
+                    )
+            else:
+                sample.opd_generation_byte_evidence_attempted = True
+                sample.opd_generation_byte_evidence_complete = True
+                sample.opd_generation_byte_evidence_validated = True
+                sample.opd_generation_byte_evidence_error = None
+                sample.opd_generation_byte_evidence_metadata = generation_byte_evidence_metadata | {
+                    "response_token_count": sample.response_length,
+                    "response_byte_length": len(response_bytes),
+                    "generation_token_text_count": generation_token_text_count,
+                    "evidence_kind": "generation_byte_evidence",
+                }
+        else:
+            if sample.opd_generation_byte_evidence_attempted is None:
+                sample.opd_generation_byte_evidence_attempted = False
+            try:
+                response_bytes, response_spans = build_recorded_student_response_alignment_from_token_ids(
+                    tokenizer=student_tokenizer,
+                    response_text=sample.opd_response_text,
+                    response_token_ids=sample.tokens[-sample.response_length :],
+                )
+                evidence_kind = "recorded_builder_token_ids"
+            except Exception:
                 response_bytes, response_spans = build_recorded_student_response_alignment(
                     student_tokenizer,
                     full_token_ids=sample.tokens,
@@ -238,15 +349,6 @@ def _record_student_opd_alignment(sample: Sample, student_tokenizer) -> None:
                     response_text=sample.opd_response_text,
                     full_text=sample.opd_full_text,
                 )
-        else:
-            response_bytes, response_spans = build_recorded_student_response_alignment(
-                student_tokenizer,
-                full_token_ids=sample.tokens,
-                prompt_token_count=len(sample.tokens) - sample.response_length,
-                prompt_text=sample.opd_prompt_text or "",
-                response_text=sample.opd_response_text,
-                full_text=sample.opd_full_text,
-            )
         sample.opd_student_response_bytes = list(response_bytes)
         sample.opd_student_token_byte_spans = [list(span) for span in response_spans]
         sample.opd_student_alignment_version = 1
@@ -254,6 +356,15 @@ def _record_student_opd_alignment(sample: Sample, student_tokenizer) -> None:
         sample.opd_student_alignment_source = alignment_source
         sample.opd_student_alignment_validated = True
         sample.opd_student_alignment_status = "ok_recorded"
+        sample.opd_student_alignment_complete = True
+        alignment_metadata = base_alignment_metadata | {
+            "response_token_count": sample.response_length,
+            "response_byte_length": len(response_bytes),
+            "evidence_kind": evidence_kind,
+        }
+        if generation_token_text_count is not None:
+            alignment_metadata["generation_token_text_count"] = generation_token_text_count
+        sample.opd_student_alignment_metadata = alignment_metadata
     except Exception as exc:
         sample.opd_student_response_bytes = None
         sample.opd_student_token_byte_spans = None
@@ -265,6 +376,14 @@ def _record_student_opd_alignment(sample: Sample, student_tokenizer) -> None:
         sample.opd_student_alignment_source = "recorded_builder"
         sample.opd_student_alignment_validated = False
         sample.opd_student_alignment_status = "recorded_missing"
+        sample.opd_student_alignment_complete = False
+        sample.opd_student_alignment_metadata = base_alignment_metadata | {
+            "response_token_count": sample.response_length,
+            "generation_token_text_count": generation_token_text_count if "generation_token_text_count" in locals() else None,
+            "evidence_kind": "recorded_builder_failed",
+        }
+        if sample.opd_generation_byte_evidence_attempted is None:
+            sample.opd_generation_byte_evidence_attempted = False
 
 
 def compute_teacher_log_probs_for_sample(args, sample: Sample) -> torch.Tensor:

@@ -7,24 +7,25 @@ import torch
 
 
 def _install_fake_megatron():
-    megatron = types.ModuleType("megatron")
-    megatron_core = types.ModuleType("megatron.core")
     megatron_mpu = types.SimpleNamespace(
         get_tensor_model_parallel_rank=lambda: 0,
+        get_tensor_model_parallel_group=lambda: None,
         is_pipeline_last_stage=lambda: True,
         get_context_parallel_world_size=lambda: 1,
         get_context_parallel_rank=lambda: 0,
-        get_tensor_model_parallel_group=lambda: None,
+        get_context_parallel_group=lambda: None,
     )
-    packed_seq_params = types.ModuleType("megatron.core.packed_seq_params")
+    megatron = sys.modules.setdefault("megatron", types.ModuleType("megatron"))
+    megatron_core = sys.modules.setdefault("megatron.core", types.ModuleType("megatron.core"))
+    packed_seq_params = sys.modules.setdefault(
+        "megatron.core.packed_seq_params",
+        types.ModuleType("megatron.core.packed_seq_params"),
+    )
     packed_seq_params.PackedSeqParams = object
 
     megatron.core = megatron_core
     megatron_core.mpu = megatron_mpu
-    sys.modules.setdefault("megatron", megatron)
-    sys.modules.setdefault("megatron.core", megatron_core)
-    sys.modules.setdefault("megatron.core.mpu", megatron_mpu)
-    sys.modules.setdefault("megatron.core.packed_seq_params", packed_seq_params)
+    sys.modules["megatron.core.mpu"] = megatron_mpu
 
 
 _install_fake_megatron()
@@ -83,6 +84,22 @@ def test_generate_keeps_rollout_log_probs_aligned_with_response_tokens_when_trun
     assert updated.response_length == 2
     assert updated.rollout_log_probs == [-0.1, -0.2]
     assert updated.opd_student_token_texts == ["A", "B"]
+    assert updated.opd_student_alignment_version == 2
+    assert updated.opd_student_alignment_source == "generation_byte_evidence"
+    assert updated.opd_student_alignment_complete is True
+    assert updated.opd_student_alignment_validated is True
+    assert updated.opd_student_response_bytes == [65, 66]
+    assert updated.opd_student_token_byte_spans == [[0, 1], [1, 2]]
+    assert updated.opd_student_alignment_metadata == {
+        "engine": "sglang",
+        "detokenizer_protocol": "output_token_logprobs_text",
+        "completion_reason": "length",
+        "captured_response_token_count": 2,
+        "response_token_count": 2,
+        "response_byte_length": 2,
+        "generation_token_text_count": 2,
+        "evidence_kind": "generation_byte_evidence",
+    }
     assert len(updated.rollout_log_probs) == updated.response_length
     assert updated.tokens[-updated.response_length :] == [11, 12]
     assert captured_payload["return_text_in_logprobs"] is True

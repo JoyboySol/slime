@@ -29,6 +29,10 @@ NUM_GPUS="${NUM_GPUS:-3}"
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 SGLANG_PORT="${SGLANG_PORT:-30110}"
 TEACHER_PORT="${TEACHER_PORT:-30221}"
+REUSE_EXISTING_SERVERS="${REUSE_EXISTING_SERVERS:-0}"
+SGLANG_ROUTER_IP="${SGLANG_ROUTER_IP:-127.0.0.1}"
+SGLANG_ROUTER_PORT="${SGLANG_ROUTER_PORT:-${SGLANG_PORT}}"
+ROLLOUT_EXTERNAL_ENGINE_ADDRS="${ROLLOUT_EXTERNAL_ENGINE_ADDRS:-}"
 
 # WORK_DIR="${WORK_DIR:-${SLIME_DIR}/.tmp/yulan_cross_tokenizer_opd_train}"
 REF_LOAD="${REF_LOAD:-${WORK_DIR}/yulan_torch_dist}"
@@ -189,13 +193,24 @@ fi
 
 ROLLOUT_NUM_GPUS="$(count_visible_devices "${ROLLOUT_CUDA_VISIBLE_DEVICES}")"
 validate_gpu_partition
+ROLLOUT_NUM_GPUS_EFFECTIVE="${ROLLOUT_NUM_GPUS}"
+if [[ "${REUSE_EXISTING_SERVERS}" == "1" ]]; then
+    if [[ -n "${ROLLOUT_EXTERNAL_ENGINE_ADDRS}" ]]; then
+        IFS=',' read -r -a ROLLOUT_EXTERNAL_ADDR_ARRAY <<<"${ROLLOUT_EXTERNAL_ENGINE_ADDRS}"
+        ROLLOUT_NUM_GPUS_EFFECTIVE=$(( ${#ROLLOUT_EXTERNAL_ADDR_ARRAY[@]} * ROLLOUT_NUM_GPUS_PER_ENGINE ))
+    fi
+fi
 RAY_CUDA_VISIBLE_DEVICES="${TRAIN_CUDA_VISIBLE_DEVICES}"
 if [[ -n "${ROLLOUT_CUDA_VISIBLE_DEVICES}" ]]; then
     RAY_CUDA_VISIBLE_DEVICES="${RAY_CUDA_VISIBLE_DEVICES},${ROLLOUT_CUDA_VISIBLE_DEVICES}"
 fi
 RAY_NUM_GPUS=$(( NUM_GPUS + ROLLOUT_NUM_GPUS ))
+if [[ "${REUSE_EXISTING_SERVERS}" == "1" ]]; then
+    RAY_CUDA_VISIBLE_DEVICES="${TRAIN_CUDA_VISIBLE_DEVICES}"
+    RAY_NUM_GPUS="${NUM_GPUS}"
+fi
 
-if (( ROLLOUT_NUM_GPUS < ROLLOUT_NUM_GPUS_PER_ENGINE )); then
+if [[ "${REUSE_EXISTING_SERVERS}" != "1" ]] && (( ROLLOUT_NUM_GPUS < ROLLOUT_NUM_GPUS_PER_ENGINE )); then
     echo "ROLLOUT_CUDA_VISIBLE_DEVICES=${ROLLOUT_CUDA_VISIBLE_DEVICES:-<empty>} provides ${ROLLOUT_NUM_GPUS} GPU(s), which is less than ROLLOUT_NUM_GPUS_PER_ENGINE=${ROLLOUT_NUM_GPUS_PER_ENGINE}." >&2
     exit 1
 fi
@@ -330,11 +345,13 @@ fi
 
 cleanup() {
     set +e
-    if [[ -n "${TEACHER_PID:-}" ]]; then
-        kill "${TEACHER_PID}" >/dev/null 2>&1 || true
-        wait "${TEACHER_PID}" >/dev/null 2>&1 || true
+    if [[ "${REUSE_EXISTING_SERVERS}" != "1" ]]; then
+        if [[ -n "${TEACHER_PID:-}" ]]; then
+            kill "${TEACHER_PID}" >/dev/null 2>&1 || true
+            wait "${TEACHER_PID}" >/dev/null 2>&1 || true
+        fi
+        ray stop --force >/dev/null 2>&1 || true
     fi
-    ray stop --force >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -383,9 +400,13 @@ echo "  TEACHER_CUDA_VISIBLE_DEVICES=${TEACHER_CUDA_VISIBLE_DEVICES}"
 echo "  ROLLOUT_CUDA_VISIBLE_DEVICES=${ROLLOUT_CUDA_VISIBLE_DEVICES:-<empty>}"
 echo "  RAY_CUDA_VISIBLE_DEVICES=${RAY_CUDA_VISIBLE_DEVICES}"
 echo "  RAY_NUM_GPUS=${RAY_NUM_GPUS}"
+echo "  ROLLOUT_NUM_GPUS_EFFECTIVE=${ROLLOUT_NUM_GPUS_EFFECTIVE}"
 echo "  WORK_DIR=${WORK_DIR}"
 echo "  WORK_DIR_LINK_PATH=${WORK_DIR_LINK_PATH}"
 echo "  WANDB_MODE=${WANDB_MODE}"
+echo "  REUSE_EXISTING_SERVERS=${REUSE_EXISTING_SERVERS}"
+echo "  SGLANG_ROUTER_IP=${SGLANG_ROUTER_IP}"
+echo "  SGLANG_ROUTER_PORT=${SGLANG_ROUTER_PORT}"
 if [[ -n "${WANDB_API_KEY}" ]]; then
     echo "  W&B enabled with project=${WANDB_PROJECT} group=${WANDB_GROUP}"
 else
@@ -393,10 +414,14 @@ else
 fi
 
 echo "[1/9] Clean stale ray/sglang processes"
-pkill -f "python3? -m sglang.launch_server" || true
-ray stop --force || true
-pkill -f "ray::" || true
-sleep 2
+if [[ "${REUSE_EXISTING_SERVERS}" != "1" ]]; then
+    pkill -f "python3? -m sglang.launch_server" || true
+    ray stop --force || true
+    pkill -f "ray::" || true
+    sleep 2
+else
+    echo "  Reuse mode enabled; keeping existing teacher / rollout / ray services alive"
+fi
 
 echo "[2/9] Load student model config"
 MODEL_CONFIG_SCRIPT="$(resolve_model_config_script)"
@@ -534,13 +559,29 @@ OPTIMIZER_ARGS=(
 )
 
 SGLANG_ARGS=(
-    --rollout-num-gpus "${ROLLOUT_NUM_GPUS}"
+    --rollout-num-gpus "${ROLLOUT_NUM_GPUS_EFFECTIVE}"
     --rollout-num-gpus-per-engine "${ROLLOUT_NUM_GPUS_PER_ENGINE}"
     --sglang-host 127.0.0.1
     --sglang-port "${SGLANG_PORT}"
     --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC}"
     --sglang-context-length "${SGLANG_CONTEXT_LENGTH}"
 )
+if [[ "${REUSE_EXISTING_SERVERS}" == "1" ]]; then
+    if [[ -z "${ROLLOUT_EXTERNAL_ENGINE_ADDRS}" ]]; then
+        echo "ROLLOUT_EXTERNAL_ENGINE_ADDRS must be set when REUSE_EXISTING_SERVERS=1." >&2
+        exit 1
+    fi
+    if (( ${#ROLLOUT_EXTERNAL_ADDR_ARRAY[@]} == 0 )); then
+        echo "ROLLOUT_EXTERNAL_ENGINE_ADDRS did not yield any usable addresses." >&2
+        exit 1
+    fi
+    SGLANG_ARGS+=(
+        --rollout-external
+        --sglang-router-ip "${SGLANG_ROUTER_IP}"
+        --sglang-router-port "${SGLANG_ROUTER_PORT}"
+        --rollout-external-engine-addrs "${ROLLOUT_EXTERNAL_ADDR_ARRAY[@]}"
+    )
+fi
 
 DEBUG_ARGS=(
     --save-debug-rollout-data "${DEBUG_ROLLOUT_DIR}/rollout_{rollout_id}.pt"

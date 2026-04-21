@@ -10,7 +10,12 @@ from torch.utils.checkpoint import checkpoint
 
 from slime.utils.distributed_utils import distributed_masked_whiten
 from slime.utils.misc import load_function
-from slime.utils.opd_utils import compute_byte_chunk_reverse_kl, decode_token_ids, get_cached_tokenizer
+from slime.utils.opd_utils import (
+    compute_byte_chunk_reverse_kl,
+    decode_token_ids,
+    get_cached_tokenizer,
+    get_student_alignment_evidence_from_rollout_data,
+)
 from slime.utils.ppo_utils import (
     calculate_log_probs_and_entropy,
     compute_approx_kl,
@@ -591,6 +596,7 @@ def apply_opd_kl_to_advantages(
                 teacher_log_probs=teacher_log_probs[i],
                 student_tokenizer=student_tokenizer,
                 teacher_tokenizer=teacher_tokenizer,
+                student_alignment_evidence=get_student_alignment_evidence_from_rollout_data(rollout_data, i),
                 recorded_student_response_bytes=(
                     student_response_bytes_list[i] if student_response_bytes_list is not None else None
                 ),

@@ -107,7 +107,9 @@ class ServerGroup:
 
         num_gpu_per_engine = min(self.num_gpus_per_engine, self.args.num_gpus_per_node)
 
-        pg, reordered_bundle_indices, reordered_gpu_ids = self.pg
+        pg = reordered_bundle_indices = reordered_gpu_ids = None
+        if not self.args.rollout_external:
+            pg, reordered_bundle_indices, reordered_gpu_ids = self.pg
 
         RolloutRayActor = ray.remote(SGLangEngine)
 
@@ -117,18 +119,20 @@ class ServerGroup:
                 continue
 
             global_rank = self.rank_offset + i
-            num_gpus = 0.2
+            num_gpus = 0.0 if self.args.rollout_external else 0.2
             num_cpus = num_gpus
 
-            # Get the base GPU ID from placement group using gpu_offset.
-            gpu_index = self.gpu_offset + i * num_gpu_per_engine
-            base_gpu_id = int(reordered_gpu_ids[gpu_index])
-
-            scheduling_strategy = PlacementGroupSchedulingStrategy(
-                placement_group=pg,
-                placement_group_capture_child_tasks=True,
-                placement_group_bundle_index=reordered_bundle_indices[gpu_index],
-            )
+            base_gpu_id = 0
+            scheduling_strategy = None
+            if not self.args.rollout_external:
+                # Get the base GPU ID from placement group using gpu_offset.
+                gpu_index = self.gpu_offset + i * num_gpu_per_engine
+                base_gpu_id = int(reordered_gpu_ids[gpu_index])
+                scheduling_strategy = PlacementGroupSchedulingStrategy(
+                    placement_group=pg,
+                    placement_group_capture_child_tasks=True,
+                    placement_group_bundle_index=reordered_bundle_indices[gpu_index],
+                )
 
             env_vars = {name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST} | {
                 key: os.environ.get(key, default_val)
@@ -149,13 +153,18 @@ class ServerGroup:
             if external_model_package:
                 env_vars["SGLANG_EXTERNAL_MODEL_PACKAGE"] = external_model_package
 
-            rollout_engine = RolloutRayActor.options(
+            actor_options = dict(
                 num_cpus=num_cpus,
                 num_gpus=num_gpus,
-                scheduling_strategy=scheduling_strategy,
                 runtime_env={
                     "env_vars": env_vars,
                 },
+            )
+            if scheduling_strategy is not None:
+                actor_options["scheduling_strategy"] = scheduling_strategy
+
+            rollout_engine = RolloutRayActor.options(
+                **actor_options,
             ).remote(
                 self.args,
                 rank=global_rank,
@@ -794,6 +803,12 @@ class RolloutManager:
         if any(sample.opd_student_alignment_source is not None for sample in samples):
             train_data["opd_student_alignment_source_list"] = [sample.opd_student_alignment_source for sample in samples]
 
+        if any(sample.opd_student_alignment_version is not None for sample in samples):
+            train_data["opd_student_alignment_version_list"] = [sample.opd_student_alignment_version for sample in samples]
+
+        if any(sample.opd_student_alignment_complete is not None for sample in samples):
+            train_data["opd_student_alignment_complete_list"] = [sample.opd_student_alignment_complete for sample in samples]
+
         if any(sample.opd_student_alignment_validated is not None for sample in samples):
             train_data["opd_student_alignment_validated_list"] = [sample.opd_student_alignment_validated for sample in samples]
 
@@ -802,6 +817,34 @@ class RolloutManager:
 
         if any(sample.opd_student_alignment_error is not None for sample in samples):
             train_data["opd_student_alignment_error_list"] = [sample.opd_student_alignment_error for sample in samples]
+
+        if any(sample.opd_student_alignment_metadata is not None for sample in samples):
+            train_data["opd_student_alignment_metadata_list"] = [sample.opd_student_alignment_metadata for sample in samples]
+
+        if any(sample.opd_generation_byte_evidence_attempted is not None for sample in samples):
+            train_data["opd_generation_byte_evidence_attempted_list"] = [
+                sample.opd_generation_byte_evidence_attempted for sample in samples
+            ]
+
+        if any(sample.opd_generation_byte_evidence_complete is not None for sample in samples):
+            train_data["opd_generation_byte_evidence_complete_list"] = [
+                sample.opd_generation_byte_evidence_complete for sample in samples
+            ]
+
+        if any(sample.opd_generation_byte_evidence_validated is not None for sample in samples):
+            train_data["opd_generation_byte_evidence_validated_list"] = [
+                sample.opd_generation_byte_evidence_validated for sample in samples
+            ]
+
+        if any(sample.opd_generation_byte_evidence_error is not None for sample in samples):
+            train_data["opd_generation_byte_evidence_error_list"] = [
+                sample.opd_generation_byte_evidence_error for sample in samples
+            ]
+
+        if any(sample.opd_generation_byte_evidence_metadata is not None for sample in samples):
+            train_data["opd_generation_byte_evidence_metadata_list"] = [
+                sample.opd_generation_byte_evidence_metadata for sample in samples
+            ]
 
         return train_data
 
@@ -847,10 +890,13 @@ class RolloutManager:
                 "opd_full_texts",
                 "opd_student_response_bytes_list",
                 "opd_student_token_byte_spans_list",
+                "opd_student_alignment_version_list",
                 "opd_student_alignment_source_list",
+                "opd_student_alignment_complete_list",
                 "opd_student_alignment_validated_list",
                 "opd_student_alignment_status_list",
                 "opd_student_alignment_error_list",
+                "opd_student_alignment_metadata_list",
             ]:
                 if key not in data:
                     continue

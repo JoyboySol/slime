@@ -9,6 +9,7 @@ import torch
 
 from slime.utils.opd_utils import (
     build_recorded_student_response_alignment,
+    build_recorded_student_response_alignment_from_token_ids,
     build_token_byte_spans,
     clip_token_bytes_by_region,
     compute_byte_chunk_aligned_log_probs,
@@ -138,3 +139,61 @@ def test_sampled_real_tokenizer_byte_alignment_matches_teacher_bytes(dataset_nam
 
         assert student_chunk_log_probs.shape[0] == len(response_token_ids)
         assert teacher_chunk_log_probs.shape[0] == len(response_token_ids)
+
+
+@pytest.mark.parametrize(
+    ("dataset_name", "dataset_path", "sample_limit"),
+    [
+        ("short", SHORT_DATA_PATH, 128),
+        ("long", LONG_DATA_PATH, 128),
+    ],
+)
+def test_sampled_real_tokenizer_response_token_ids_reconstruct_response_bytes(dataset_name, dataset_path, sample_limit):
+    del dataset_name
+
+    for required_path in (STUDENT_MODEL_PATH, dataset_path):
+        _require_local_path(required_path)
+
+    student_tokenizer = get_cached_tokenizer(STUDENT_MODEL_PATH)
+
+    for source_file, row_index, row in _collect_rows(dataset_path, sample_limit):
+        del source_file, row_index
+        messages = _ANALYZE_MODULE._normalize_messages(row)
+        prompt_messages = messages[:-1]
+        assert prompt_messages, "Expected at least one prompt message before the assistant response"
+
+        raw_tools = row.get("tools")
+        tools = _ANALYZE_MODULE._jsonable(raw_tools) if raw_tools is not None else None
+
+        rendered_full_text = _ANALYZE_MODULE._apply_chat_template(
+            student_tokenizer, messages, tokenize=False, tools=tools
+        )
+        rendered_prompt_text = _ANALYZE_MODULE._apply_prompt_template(
+            student_tokenizer, prompt_messages, tokenize=False, tools=tools
+        )
+        rendered_response_text = rendered_full_text[len(rendered_prompt_text) :]
+
+        student_full_token_ids = list(
+            _ANALYZE_MODULE._apply_chat_template(student_tokenizer, messages, tokenize=True, tools=tools)
+        )
+        prompt_token_ids = list(
+            _ANALYZE_MODULE._apply_prompt_template(student_tokenizer, prompt_messages, tokenize=True, tools=tools)
+        )
+        response_token_ids = student_full_token_ids[len(prompt_token_ids) :]
+        assert response_token_ids, "Expected response tokens in sampled row"
+
+        response_bytes, response_spans = build_recorded_student_response_alignment_from_token_ids(
+            tokenizer=student_tokenizer,
+            response_text=rendered_response_text,
+            response_token_ids=response_token_ids,
+        )
+
+        token_bytes, normalized_spans = validate_recorded_student_response_alignment(
+            response_text=rendered_response_text,
+            response_token_count=len(response_token_ids),
+            response_bytes=response_bytes,
+            token_byte_spans=response_spans,
+        )
+
+        assert b"".join(token_bytes) == rendered_response_text.encode("utf-8")
+        assert normalized_spans[-1][1] == len(response_bytes)

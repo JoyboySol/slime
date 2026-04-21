@@ -38,6 +38,13 @@ class Sample:
     opd_student_alignment_source: str | None = None  # Where the recorded student alignment came from
     opd_student_alignment_validated: bool | None = None  # Whether the recorded student alignment was validated
     opd_student_alignment_status: str | None = None  # High-level recorded alignment lifecycle status
+    opd_student_alignment_complete: bool | None = None  # Whether byte evidence is complete enough for direct use
+    opd_student_alignment_metadata: dict[str, Any] | None = None  # Structured alignment protocol metadata
+    opd_generation_byte_evidence_attempted: bool | None = None  # Whether rollout attempted generation-native byte evidence
+    opd_generation_byte_evidence_complete: bool | None = None  # Whether generation-native byte evidence was complete
+    opd_generation_byte_evidence_validated: bool | None = None  # Whether generation-native byte evidence was valid
+    opd_generation_byte_evidence_error: str | None = None  # Structured reason when generation-native byte evidence failed
+    opd_generation_byte_evidence_metadata: dict[str, Any] | None = None  # Structured generation-native byte evidence metadata
 
     class Status(Enum):
         PENDING = "pending"

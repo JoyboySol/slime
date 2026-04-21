@@ -8,12 +8,15 @@ from pathlib import Path
 import torch
 
 from slime.rollout.on_policy_distillation import compute_teacher_log_probs_for_sample
+from slime.utils.opd_metric_utils import summarize_opd_alignment
 from slime.utils.opd_utils import (
     build_token_byte_spans,
     clip_token_bytes_by_region,
     compute_byte_chunk_aligned_log_probs,
     encode_text,
+    get_generation_byte_evidence_observability,
     get_cached_tokenizer,
+    get_student_alignment_evidence,
 )
 from slime.utils.types import Sample
 
@@ -87,9 +90,17 @@ def _summarize_sample(sample: Sample, args: argparse.Namespace) -> dict:
         summary["student_alignment_source"] = (
             "recorded_payload" if sample.opd_student_response_bytes is not None else "legacy_reconstruction"
         )
+        summary["recorded_alignment_evidence"] = get_student_alignment_evidence(sample)
         summary["recorded_alignment_source"] = sample.opd_student_alignment_source
+        summary["recorded_alignment_version"] = sample.opd_student_alignment_version
+        summary["recorded_alignment_complete"] = sample.opd_student_alignment_complete
         summary["recorded_alignment_validated"] = sample.opd_student_alignment_validated
         summary["recorded_alignment_status"] = sample.opd_student_alignment_status
+        generation_byte_evidence = get_generation_byte_evidence_observability(sample) or {}
+        summary["generation_byte_evidence_attempted"] = generation_byte_evidence.get("attempted")
+        summary["generation_byte_evidence_complete"] = generation_byte_evidence.get("complete")
+        summary["generation_byte_evidence_validated"] = generation_byte_evidence.get("validated")
+        summary["generation_byte_evidence_error"] = generation_byte_evidence.get("error")
         summary["student_chunk_mean"] = float(student_chunk_log_probs.mean().item())
         summary["teacher_chunk_mean"] = float(teacher_chunk_log_probs.mean().item())
     except Exception as exc:  # noqa: BLE001
@@ -101,14 +112,43 @@ def _summarize_sample(sample: Sample, args: argparse.Namespace) -> dict:
             "rollout_log_prob_count": len(sample.rollout_log_probs or []),
             "byte_chunk_alignment": f"failed:{type(exc).__name__}",
             "error": str(exc),
+            "recorded_alignment_evidence": get_student_alignment_evidence(sample),
             "recorded_alignment_source": sample.opd_student_alignment_source,
+            "recorded_alignment_version": sample.opd_student_alignment_version,
+            "recorded_alignment_complete": sample.opd_student_alignment_complete,
             "recorded_alignment_validated": sample.opd_student_alignment_validated,
             "recorded_alignment_status": sample.opd_student_alignment_status,
+            "generation_byte_evidence_attempted": sample.opd_generation_byte_evidence_attempted,
+            "generation_byte_evidence_complete": sample.opd_generation_byte_evidence_complete,
+            "generation_byte_evidence_validated": sample.opd_generation_byte_evidence_validated,
+            "generation_byte_evidence_error": sample.opd_generation_byte_evidence_error,
             "prompt_preview": (prompt_text or "")[: args.preview_chars],
             "response_preview": (sample.response or "")[: args.preview_chars],
         }
 
     return summary
+
+
+def _summarize_generation_byte_evidence_metrics(summaries: list[dict]) -> dict[str, float]:
+    metrics, _summary_text = summarize_opd_alignment(
+        status_values=None,
+        complete_values=[summary.get("recorded_alignment_complete") for summary in summaries],
+        source_values=[summary.get("recorded_alignment_source") for summary in summaries],
+        validated_values=[summary.get("recorded_alignment_validated") for summary in summaries],
+        error_values=None,
+        generation_attempted_values=[summary.get("generation_byte_evidence_attempted") for summary in summaries],
+        generation_complete_values=[summary.get("generation_byte_evidence_complete") for summary in summaries],
+        generation_validated_values=[summary.get("generation_byte_evidence_validated") for summary in summaries],
+    )
+    return {
+        "generation_byte_evidence_sample_count": int(metrics.get("opd_generation_byte_evidence_sample_count", 0.0)),
+        "generation_byte_evidence_hit_count": int(metrics["opd_generation_byte_evidence_hit_count"]),
+        "generation_byte_evidence_hit_rate": metrics["opd_generation_byte_evidence_hit_rate"],
+        "generation_byte_evidence_incomplete_count": int(metrics["opd_generation_byte_evidence_incomplete_count"]),
+        "generation_byte_evidence_incomplete_rate": metrics["opd_generation_byte_evidence_incomplete_rate"],
+        "generation_byte_evidence_invalid_count": int(metrics["opd_generation_byte_evidence_invalid_count"]),
+        "generation_byte_evidence_invalid_rate": metrics["opd_generation_byte_evidence_invalid_rate"],
+    }
 
 
 def main() -> None:
@@ -129,11 +169,24 @@ def main() -> None:
         samples = [samples[args.sample_index]]
 
     first_failure = None
+    summaries = []
     for sample in samples:
         summary = _summarize_sample(sample, args)
+        summaries.append(summary)
         print(json.dumps(summary, ensure_ascii=False))
         if first_failure is None and str(summary["byte_chunk_alignment"]).startswith("failed:"):
             first_failure = sample
+
+    if summaries:
+        print(
+            json.dumps(
+                {
+                    "summary_type": "generation_byte_evidence_metrics",
+                    **_summarize_generation_byte_evidence_metrics(summaries),
+                },
+                ensure_ascii=False,
+            )
+        )
 
     if first_failure is not None and args.dump_failing_sample is not None:
         output_path = Path(args.dump_failing_sample)

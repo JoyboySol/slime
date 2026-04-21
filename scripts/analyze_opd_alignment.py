@@ -22,6 +22,7 @@ from slime.utils.opd_utils import (
     decode_token_ids,
     encode_text,
     get_cached_tokenizer,
+    get_student_alignment_evidence,
 )
 
 matplotlib.use("Agg")
@@ -50,7 +51,9 @@ class AnalysisResult:
     first_diff_student_preview: str | None
     first_diff_teacher_preview: str | None
     response_preview: str
+    recorded_alignment_version: int | str | None = None
     recorded_alignment_source: str | None = None
+    recorded_alignment_complete: bool | None = None
     recorded_alignment_validated: bool | None = None
     recorded_alignment_status: str | None = None
 
@@ -176,12 +179,16 @@ def analyze_row(
     decoded_full_text = decode_token_ids(student_tokenizer, student_full_token_ids)
     decoded_prompt_text = decode_token_ids(student_tokenizer, prompt_token_ids)
     decoded_response_text = decode_token_ids(student_tokenizer, response_token_ids)
-    recorded_response_bytes = row.get("opd_student_response_bytes")
-    recorded_token_spans = row.get("opd_student_token_byte_spans")
-    if recorded_response_bytes is not None and recorded_token_spans is not None:
-        response_bytes = bytes(recorded_response_bytes)
+    recorded_alignment_evidence = get_student_alignment_evidence(row)
+    if (
+        recorded_alignment_evidence is not None
+        and recorded_alignment_evidence.get("response_bytes") is not None
+        and recorded_alignment_evidence.get("token_byte_spans") is not None
+    ):
+        response_bytes = bytes(recorded_alignment_evidence["response_bytes"])
         student_response_token_bytes = [
-            response_bytes[int(start) : int(end)] for start, end in recorded_token_spans
+            response_bytes[int(start) : int(end)]
+            for start, end in recorded_alignment_evidence["token_byte_spans"]
         ]
         student_reconstruction_mode = "recorded_payload"
     else:
@@ -242,7 +249,9 @@ def analyze_row(
         student_response_bytes=len(student_response_bytes),
         teacher_response_bytes=len(teacher_response_bytes),
         student_reconstruction_mode=student_reconstruction_mode,
+        recorded_alignment_version=row.get("opd_student_alignment_version"),
         recorded_alignment_source=row.get("opd_student_alignment_source"),
+        recorded_alignment_complete=row.get("opd_student_alignment_complete"),
         recorded_alignment_validated=row.get("opd_student_alignment_validated"),
         recorded_alignment_status=row.get("opd_student_alignment_status"),
         render_full_matches_decoded=(rendered_full_text == decoded_full_text),

@@ -15,7 +15,12 @@ from slime.utils.data import get_minimum_num_micro_batch_size
 from slime.utils.flops_utils import calculate_fwd_flops
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step
 from slime.utils.opd_metric_utils import summarize_opd_alignment_from_rollout_data
-from slime.utils.opd_utils import compute_byte_chunk_aligned_log_probs, decode_token_ids, get_cached_tokenizer
+from slime.utils.opd_utils import (
+    compute_byte_chunk_aligned_log_probs,
+    decode_token_ids,
+    get_cached_tokenizer,
+    get_student_alignment_evidence_from_rollout_data,
+)
 from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from slime.utils.types import RolloutBatch
 
@@ -73,6 +78,7 @@ def _get_byte_chunk_log_prob_metrics(args: Namespace, rollout_data: RolloutBatch
             teacher_log_probs=teacher_log_probs[i],
             student_tokenizer=student_tokenizer,
             teacher_tokenizer=teacher_tokenizer,
+            student_alignment_evidence=get_student_alignment_evidence_from_rollout_data(rollout_data, i),
             recorded_student_response_bytes=(
                 student_response_bytes_list[i] if student_response_bytes_list is not None else None
             ),
@@ -515,10 +521,18 @@ def log_rollout_data(
                 "opd_response_texts",
                 "opd_student_response_bytes_list",
                 "opd_student_token_byte_spans_list",
+                "opd_student_alignment_version_list",
                 "opd_student_alignment_source_list",
+                "opd_student_alignment_complete_list",
                 "opd_student_alignment_validated_list",
                 "opd_student_alignment_status_list",
                 "opd_student_alignment_error_list",
+                "opd_student_alignment_metadata_list",
+                "opd_generation_byte_evidence_attempted_list",
+                "opd_generation_byte_evidence_complete_list",
+                "opd_generation_byte_evidence_validated_list",
+                "opd_generation_byte_evidence_error_list",
+                "opd_generation_byte_evidence_metadata_list",
             ]:
                 continue
             # Upload per sample mean for each rollout value
