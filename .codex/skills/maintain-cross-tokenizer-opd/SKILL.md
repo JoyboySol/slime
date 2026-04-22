@@ -1,6 +1,6 @@
 ---
 name: maintain-cross-tokenizer-opd
-description: Maintain the cross-tokenizer OPD training, alignment, and diagnostics pipeline in this slime repo. Use when changing byte-chunk OPD behavior, student/teacher byte alignment, rollout-side recorded alignment payloads, replay/analyze scripts, or regression tests for cross-tokenizer OPD with the YuLan student and Nanbeige teacher models.
+description: Use when changing byte-chunk OPD behavior, student/teacher byte alignment, rollout-side recorded alignment payloads, replay and analyze scripts, or regression tests for cross-tokenizer OPD with the YuLan student and Nanbeige teacher models in this slime repo.
 ---
 
 # Maintain Cross Tokenizer Opd
@@ -15,6 +15,7 @@ Use this skill when working on the cross-tokenizer OPD path that aligns student 
 - Student alignment payload is produced on the training side and stored on `Sample`.
 - OPD consumers should prefer recorded payloads over student text reconstruction.
 - Diagnostic scripts should match training behavior and prefer the same payloads.
+- Canonical `prompt_text / response_text / full_text` must describe one self-consistent boundary on the same student token chain.
 
 2. Touch the right layer:
 - Sample fields: `slime/utils/types.py`
@@ -32,6 +33,7 @@ Use this skill when working on the cross-tokenizer OPD path that aligns student 
   - `opd_student_token_byte_spans`
   - `opd_student_alignment_version`
   - `opd_student_alignment_error`
+- Do not allow teacher-side byte clipping to use a `prompt_text` whose byte length does not match the `full_text` / `response_text` boundary.
 - If recorded payloads are missing, keep compatibility behavior explicit and well logged.
 
 ## Change Patterns
@@ -41,6 +43,10 @@ Use this skill when working on the cross-tokenizer OPD path that aligns student 
 - Update the rollout-side builder in `slime/utils/opd_utils.py`.
 - Prefer full-sequence + prompt-boundary aware logic over response-only logic.
 - Validate against canonical prompt/response/full texts, not raw student decode alone.
+- If any one of `prompt_text`, `response_text`, or `full_text` falls back to token-derived text, re-check whether the other two must fall back as well.
+- Treat these as required invariants, not nice-to-have checks:
+  - `full_text.startswith(prompt_text)`
+  - `full_text == f"{prompt_text}{response_text}"`
 - Keep empty spans explicit instead of silently dropping tokens.
 
 ### When changing OPD consumption
@@ -48,6 +54,7 @@ Use this skill when working on the cross-tokenizer OPD path that aligns student 
 - Update `compute_byte_chunk_aligned_log_probs()` / `compute_byte_chunk_reverse_kl()`.
 - Payload-first behavior must remain the default when recorded alignment is present.
 - Keep sequence fallback behavior intact and test both enabled and disabled modes.
+- If alignment fails on long samples, inspect prompt/response byte boundaries before touching `align_token_byte_chunks()`.
 
 ### When changing diagnostics
 
@@ -59,6 +66,7 @@ Use this skill when working on the cross-tokenizer OPD path that aligns student 
   - legacy reconstruction used
   - teacher-side reconstruction failure
   - chunk alignment failure
+- When replay says `Student token bytes ended before chunk alignment completed`, explicitly check whether `opd_full_text` begins with `opd_prompt_text` and whether `opd_full_text == opd_prompt_text + opd_response_text`.
 
 ## Testing
 
@@ -89,6 +97,12 @@ If you changed diagnostics or payload selection, also run:
 For a compact file map and copy-paste command list, read
 `references/quick-reference.md`.
 
+High-value regression for canonical-boundary changes:
+
+```bash
+./.venv/bin/pytest tests/test_opd_byte_chunk.py -k "canonical_opd_texts or replay_summary_uses_training_canonical_texts" -v
+```
+
 ## Real-Environment Regression
 
 Use these exact real-environment assets when verifying cross-tokenizer alignment behavior:
@@ -105,14 +119,23 @@ Current expectation:
 - Verify at least 128 sampled rows from each corpus when making risky alignment changes.
 - Treat a passing 128/128 short + 128/128 long run as the baseline evidence standard.
 
+Known high-pressure reproducer:
+- `/mnt/hdd/lvzhihao/slime_opd_train_workdir_cross_tokenizer_full_7gpu_len16384/debug_rollouts/rollout_0.pt`
+  - Before the canonical-boundary fix, replay failed on 96 / 132 samples with
+    `Student token bytes ended before chunk alignment completed.`
+  - After fixing `_build_canonical_opd_texts(...)` to keep prompt/response/full on the same token chain, replay became 132 / 132 ok.
+
 ## Debugging Order
 
 When investigating a regression, check in this order:
 
 1. Does the sample carry recorded student alignment payloads?
-2. Do recorded response bytes equal canonical response text bytes?
-3. Does teacher response byte slicing still match the same canonical bytes?
-4. Does byte-chunk alignment fail only after both sides are valid?
-5. Are diagnostics scripts reproducing the same path as training?
+2. Is the canonical text trio self-consistent?
+   - `full_text.startswith(prompt_text)`
+   - `full_text == prompt_text + response_text`
+3. Do recorded response bytes equal canonical response text bytes?
+4. Does teacher response byte slicing still match the same canonical bytes?
+5. Does byte-chunk alignment fail only after both sides are valid?
+6. Are diagnostics scripts reproducing the same path as training?
 
-Do not jump straight to patching `align_token_byte_chunks()` if the actual breakage is in payload production or canonical text construction.
+Do not jump straight to patching `align_token_byte_chunks()` if the actual breakage is in payload production, canonical text construction, or prompt-response boundary drift.

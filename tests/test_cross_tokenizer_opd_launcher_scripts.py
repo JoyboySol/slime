@@ -17,6 +17,11 @@ def test_train_launcher_supports_reuse_existing_servers_mode():
     assert 'ROLLOUT_EXTERNAL_ENGINE_ADDRS' in text
     assert 'SGLANG_ROUTER_IP' in text
     assert 'SGLANG_ROUTER_PORT' in text
+    assert '--rollout-max-context-len "${SGLANG_CONTEXT_LENGTH}"' in text
+    assert 'ROLLOUT_MAX_PROMPT_LEN + ROLLOUT_MAX_RESPONSE_LEN' in text
+    assert 'must not exceed SGLANG_CONTEXT_LENGTH' in text
+    assert 'WANDB_RUN_ID="${WANDB_RUN_ID:-}"' in text
+    assert 'WANDB_ARGS+=(--wandb-run-id "${WANDB_RUN_ID}")' in text
 
 
 def test_smoke_launcher_supports_reuse_existing_servers_mode():
@@ -33,3 +38,6 @@ def test_smoke_launcher_supports_reuse_existing_servers_mode():
     assert 'GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE} must be divisible by NUM_GPUS=${NUM_GPUS}' in text
     assert 'sync_reuse_external_sglang_config()' in text
     assert 'EXTERNAL_SGLANG_SUMMARY=' in text
+    assert '--rollout-max-context-len "${SGLANG_CONTEXT_LENGTH}"' in text
+    assert 'ROLLOUT_MAX_PROMPT_LEN + ROLLOUT_MAX_RESPONSE_LEN' in text
+    assert 'must not exceed SGLANG_CONTEXT_LENGTH' in text

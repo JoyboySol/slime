@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from slime.rollout.on_policy_distillation import compute_teacher_log_probs_for_sample
+from slime.rollout.on_policy_distillation import _build_canonical_opd_texts, compute_teacher_log_probs_for_sample
 from slime.utils.opd_metric_utils import summarize_opd_alignment
 from slime.utils.opd_utils import (
     build_token_byte_spans,
@@ -21,16 +21,20 @@ from slime.utils.opd_utils import (
 from slime.utils.types import Sample
 
 
-def _canonical_texts(sample: Sample) -> tuple[str, str, str]:
-    prompt_text = sample.opd_prompt_text if sample.opd_prompt_text is not None else sample.prompt
-    response_text = sample.opd_response_text if sample.opd_response_text is not None else sample.response
-    full_text = sample.opd_full_text if sample.opd_full_text is not None else f"{prompt_text}{response_text}"
-    return prompt_text, response_text, full_text
+def _canonical_texts(sample: Sample, student_tokenizer) -> tuple[str, str, str]:
+    prompt_token_ids = sample.tokens[:-sample.response_length] if sample.response_length > 0 else sample.tokens
+    return _build_canonical_opd_texts(
+        sample=sample,
+        student_tokenizer=student_tokenizer,
+        prompt_token_ids=prompt_token_ids,
+    )
 
 
 def _normalize_args(args: argparse.Namespace) -> argparse.Namespace:
     if not hasattr(args, "opd_teacher_hf_checkpoint"):
         args.opd_teacher_hf_checkpoint = args.teacher_hf_checkpoint
+    if not hasattr(args, "opd_alignment"):
+        args.opd_alignment = "byte_chunk"
     return args
 
 
@@ -39,7 +43,7 @@ def _summarize_sample(sample: Sample, args: argparse.Namespace) -> dict:
     try:
         student_tokenizer = get_cached_tokenizer(args.hf_checkpoint)
         teacher_tokenizer = get_cached_tokenizer(args.teacher_hf_checkpoint)
-        prompt_text, _response_text, full_text = _canonical_texts(sample)
+        prompt_text, response_text, full_text = _canonical_texts(sample, student_tokenizer)
         prompt_byte_length = len(prompt_text.encode("utf-8"))
 
         reward_entries = sample.reward["meta_info"]["input_token_logprobs"][1:]
@@ -64,7 +68,7 @@ def _summarize_sample(sample: Sample, args: argparse.Namespace) -> dict:
             "teacher_full_token_count": len(teacher_token_ids),
             "prompt_byte_length": prompt_byte_length,
             "prompt_char_length": len(prompt_text),
-            "response_char_length": len(sample.response or ""),
+            "response_char_length": len(response_text),
         }
 
         if sample.rollout_log_probs is None:

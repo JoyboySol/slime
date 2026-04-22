@@ -474,11 +474,26 @@ def test_replay_summary_marks_teacher_stage_failures(monkeypatch):
         teacher_hf_checkpoint="teacher",
         preview_chars=32,
     )
+    student_tokenizer = BoundaryAwareTokenizer(
+        token_map={1: "P", 2: "R"},
+        encode_map={"P": [1], "R": [2], "PR": [1, 2]},
+    )
+    teacher_tokenizer = BoundaryAwareTokenizer(
+        token_map={10: "P", 11: "R"},
+        encode_map={"PR": [10, 11]},
+    )
 
     def fail_teacher_log_probs(_args, _sample):
         raise ValueError("teacher stage mismatch")
 
-    monkeypatch.setattr(replay_module, "get_cached_tokenizer", lambda _path: object())
+    def fake_get_cached_tokenizer(path):
+        if path == "student":
+            return student_tokenizer
+        if path == "teacher":
+            return teacher_tokenizer
+        raise AssertionError(f"Unexpected tokenizer path: {path}")
+
+    monkeypatch.setattr(replay_module, "get_cached_tokenizer", fake_get_cached_tokenizer)
     monkeypatch.setattr(replay_module, "compute_teacher_log_probs_for_sample", fail_teacher_log_probs)
 
     summary = replay_module._summarize_sample(sample, args)
@@ -519,8 +534,23 @@ def test_replay_summary_prefers_recorded_student_alignment(monkeypatch):
         teacher_hf_checkpoint="teacher",
         preview_chars=32,
     )
+    student_tokenizer = BoundaryAwareTokenizer(
+        token_map={1: "P", 2: "A", 3: "B"},
+        encode_map={"P": [1], "AB": [2, 3], "PAB": [1, 2, 3]},
+    )
+    teacher_tokenizer = BoundaryAwareTokenizer(
+        token_map={10: "P", 11: "AB"},
+        encode_map={"PAB": [10, 11]},
+    )
 
-    monkeypatch.setattr(replay_module, "get_cached_tokenizer", lambda _path: object())
+    def fake_get_cached_tokenizer(path):
+        if path == "student":
+            return student_tokenizer
+        if path == "teacher":
+            return teacher_tokenizer
+        raise AssertionError(f"Unexpected tokenizer path: {path}")
+
+    monkeypatch.setattr(replay_module, "get_cached_tokenizer", fake_get_cached_tokenizer)
     monkeypatch.setattr(replay_module, "compute_teacher_log_probs_for_sample", lambda *_: torch.tensor([-0.4]))
 
     def fake_build_token_byte_spans(_tokenizer, full_text, token_ids):
@@ -553,6 +583,88 @@ def test_replay_summary_prefers_recorded_student_alignment(monkeypatch):
     assert summary["student_chunk_mean"] == pytest.approx(-0.25)
 
 
+def test_replay_summary_uses_training_canonical_texts_when_rendered_response_is_not_token_consistent(monkeypatch):
+    spec = importlib.util.spec_from_file_location(
+        "replay_debug_rollout_opd",
+        "/mnt/ssd/lvzhihao/PostTrain/slime/scripts/replay_debug_rollout_opd.py",
+    )
+    replay_module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(replay_module)
+
+    sample = Sample(
+        prompt="PROMPT",
+        response="bad rendered response",
+        tokens=[1, 2, 3],
+        response_length=2,
+        rollout_log_probs=[-0.25, -0.35],
+        reward={
+            "meta_info": {
+                "input_token_logprobs": [
+                    [0.0, 999],
+                    [-0.1, 10],
+                    [-0.2, 11],
+                    [-0.3, 12],
+                ]
+            }
+        },
+        opd_student_response_bytes=[65, 66],
+        opd_student_token_byte_spans=[[0, 1], [1, 2]],
+        opd_student_alignment_source="recorded_builder",
+        opd_student_alignment_validated=True,
+        opd_student_alignment_status="ok_recorded",
+        opd_student_alignment_complete=True,
+        opd_student_alignment_version=1,
+    )
+    args = Namespace(
+        hf_checkpoint="student",
+        teacher_hf_checkpoint="teacher",
+        opd_teacher_hf_checkpoint="teacher",
+        preview_chars=32,
+        reward_key=None,
+        opd_alignment="byte_chunk",
+    )
+
+    student_tokenizer = BoundaryAwareTokenizer(
+        token_map={1: "PROMPT", 2: "A", 3: "B"},
+        encode_map={"PROMPT": [1], "AB": [2, 3], "PROMPTAB": [1, 2, 3]},
+    )
+    teacher_tokenizer = BoundaryAwareTokenizer(
+        token_map={10: "PROMPT", 11: "A", 12: "B"},
+        encode_map={"PROMPTAB": [10, 11, 12]},
+    )
+
+    def fake_get_cached_tokenizer(path):
+        if path == "student":
+            return student_tokenizer
+        if path == "teacher":
+            return teacher_tokenizer
+        raise AssertionError(f"Unexpected tokenizer path: {path}")
+
+    monkeypatch.setattr(replay_module, "get_cached_tokenizer", fake_get_cached_tokenizer)
+    monkeypatch.setattr("slime.rollout.on_policy_distillation.get_cached_tokenizer", fake_get_cached_tokenizer)
+
+    def fake_prepare_byte_chunk_training_entry(**kwargs):
+        assert kwargs["prompt_text"] == "PROMPT"
+        assert kwargs["full_text"] == "PROMPTAB"
+        assert torch.allclose(kwargs["teacher_log_probs"], torch.tensor([-0.2, -0.3]))
+        return {
+            "status": "ok",
+            "student_chunk_log_probs": torch.tensor([-0.25, -0.25]),
+            "teacher_chunk_log_probs": torch.tensor([-0.2, -0.2]),
+            "reverse_kl": torch.tensor([-0.05, -0.05]),
+        }
+
+    monkeypatch.setattr(replay_module, "prepare_byte_chunk_training_entry", fake_prepare_byte_chunk_training_entry)
+
+    summary = replay_module._summarize_sample(sample, args)
+
+    assert summary["byte_chunk_alignment"] == "ok"
+    assert summary["teacher_log_prob_count"] == 2
+    assert summary["teacher_selected_response_count"] == 2
+    assert summary["student_chunk_mean"] == pytest.approx(-0.25)
+
+
 def test_replay_normalize_args_sets_opd_teacher_checkpoint():
     spec = importlib.util.spec_from_file_location(
         "replay_debug_rollout_opd",
@@ -570,6 +682,7 @@ def test_replay_normalize_args_sets_opd_teacher_checkpoint():
     normalized = replay_module._normalize_args(args)
 
     assert normalized.opd_teacher_hf_checkpoint == "teacher"
+    assert normalized.opd_alignment == "byte_chunk"
 
 
 def test_post_process_rewards_uses_teacher_tokenizer_length_for_byte_chunk(monkeypatch):
@@ -1433,6 +1546,35 @@ def test_canonical_opd_texts_fall_back_to_token_derived_text_when_rendered_respo
     assert prompt_text == "PROMPT"
     assert response_text == "AB"
     assert full_text == "PROMPTAB"
+
+
+def test_canonical_opd_texts_keep_prompt_boundary_consistent_when_full_text_falls_back_to_token_decode():
+    sample = Sample(
+        prompt="PROMPT\n",
+        response="bad rendered response",
+        tokens=[1, 2, 3],
+        response_length=2,
+    )
+    student_tokenizer = BoundaryAwareTokenizer(
+        token_map={1: "PROMPT \n", 2: "A", 3: "B"},
+        encode_map={
+            "PROMPT\n": [99],
+            "AB": [2, 3],
+            "PROMPT\nAB": [98],
+            "PROMPT \nAB": [1, 2, 3],
+        },
+    )
+
+    prompt_text, response_text, full_text = _build_canonical_opd_texts(
+        sample=sample,
+        student_tokenizer=student_tokenizer,
+        prompt_token_ids=[1],
+    )
+
+    assert prompt_text == "PROMPT \n"
+    assert response_text == "AB"
+    assert full_text == "PROMPT \nAB"
+    assert full_text == f"{prompt_text}{response_text}"
 
 
 def test_record_student_opd_alignment_uses_token_derived_canonical_text_when_rendered_response_is_not_token_consistent():

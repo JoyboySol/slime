@@ -35,6 +35,7 @@ ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-3}"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-2}"
 NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-1}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-6}"
+ROLLOUT_MAX_PROMPT_LEN="${ROLLOUT_MAX_PROMPT_LEN:-}"
 ROLLOUT_MAX_RESPONSE_LEN="${ROLLOUT_MAX_RESPONSE_LEN:-256}"
 ROLLOUT_TEMPERATURE="${ROLLOUT_TEMPERATURE:-0.8}"
 
@@ -85,6 +86,21 @@ fi
 
 if (( GLOBAL_BATCH_SIZE % NUM_GPUS != 0 )); then
     echo "GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE} must be divisible by NUM_GPUS=${NUM_GPUS} for the current data parallel layout." >&2
+    exit 1
+fi
+
+if [[ -z "${ROLLOUT_MAX_PROMPT_LEN}" ]]; then
+    ROLLOUT_MAX_PROMPT_LEN=$(( SGLANG_CONTEXT_LENGTH - ROLLOUT_MAX_RESPONSE_LEN ))
+fi
+
+if (( ROLLOUT_MAX_PROMPT_LEN < 1 )); then
+    echo "Invalid rollout context budget: ROLLOUT_MAX_PROMPT_LEN=${ROLLOUT_MAX_PROMPT_LEN} must be at least 1." >&2
+    exit 1
+fi
+
+if (( ROLLOUT_MAX_PROMPT_LEN + ROLLOUT_MAX_RESPONSE_LEN > SGLANG_CONTEXT_LENGTH )); then
+    echo "Invalid rollout context budget: ROLLOUT_MAX_PROMPT_LEN + ROLLOUT_MAX_RESPONSE_LEN = $((ROLLOUT_MAX_PROMPT_LEN + ROLLOUT_MAX_RESPONSE_LEN)) must not exceed SGLANG_CONTEXT_LENGTH=${SGLANG_CONTEXT_LENGTH}." >&2
+    echo "Requested prompt budget ${ROLLOUT_MAX_PROMPT_LEN} and response budget ${ROLLOUT_MAX_RESPONSE_LEN} cannot fit into the configured rollout server context length." >&2
     exit 1
 fi
 
@@ -340,6 +356,8 @@ ROLLOUT_ARGS=(
     --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT}"
     --num-steps-per-rollout "${NUM_STEPS_PER_ROLLOUT}"
     --global-batch-size "${GLOBAL_BATCH_SIZE}"
+    --rollout-max-prompt-len "${ROLLOUT_MAX_PROMPT_LEN}"
+    --rollout-max-context-len "${SGLANG_CONTEXT_LENGTH}"
     --rollout-max-response-len "${ROLLOUT_MAX_RESPONSE_LEN}"
     --rollout-temperature "${ROLLOUT_TEMPERATURE}"
     --balance-data

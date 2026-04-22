@@ -43,14 +43,16 @@ def _build_canonical_opd_texts(
     """
 
     response_token_ids = sample.tokens[len(prompt_token_ids) :]
+    decoded_prompt_text = decode_token_ids(student_tokenizer, prompt_token_ids)
     decoded_response_text = decode_token_ids(student_tokenizer, response_token_ids)
+    decoded_full_text = decode_token_ids(student_tokenizer, sample.tokens)
 
     prompt_text = sample.opd_prompt_text
     if prompt_text is None:
         if isinstance(sample.prompt, str):
             prompt_text = sample.prompt
         else:
-            prompt_text = decode_token_ids(student_tokenizer, prompt_token_ids)
+            prompt_text = decoded_prompt_text
 
     rendered_response_text = sample.opd_response_text if sample.opd_response_text is not None else sample.response
     response_text = (
@@ -63,7 +65,16 @@ def _build_canonical_opd_texts(
     if full_text is None:
         full_text = f"{prompt_text}{response_text}"
         if not _is_text_token_consistent(student_tokenizer, full_text, sample.tokens):
-            full_text = decode_token_ids(student_tokenizer, sample.tokens)
+            prompt_text = decoded_prompt_text
+            response_text = decoded_response_text
+            full_text = decoded_full_text
+    elif not full_text.startswith(prompt_text) or full_text != f"{prompt_text}{response_text}":
+        # Stored rendered prompt/full texts can drift apart on long truncated samples.
+        # Recover to one self-consistent token-derived trio so teacher byte clipping
+        # uses the exact same prompt/response boundary as student alignment.
+        prompt_text = decoded_prompt_text
+        response_text = decoded_response_text
+        full_text = decoded_full_text
 
     return prompt_text, response_text, full_text
 

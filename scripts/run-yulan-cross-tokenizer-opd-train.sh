@@ -81,6 +81,7 @@ WANDB_GROUP="${WANDB_GROUP:-deepmath103k-cross-tokenizer-opd}"
 WANDB_TEAM="${WANDB_TEAM:-}"
 WANDB_HOST="${WANDB_HOST:-}"
 WANDB_MODE="${WANDB_MODE:-online}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-}"
 
 source "${VENV_DIR}/bin/activate"
 export PYTHONPATH="${YULAN_DIR}"
@@ -188,6 +189,18 @@ fi
 
 if (( GLOBAL_BATCH_SIZE % NUM_GPUS != 0 )); then
     echo "GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE} must be divisible by NUM_GPUS=${NUM_GPUS} for the current data parallel layout." >&2
+    exit 1
+fi
+
+if (( ROLLOUT_MAX_PROMPT_LEN + ROLLOUT_MAX_RESPONSE_LEN > SGLANG_CONTEXT_LENGTH )); then
+    echo "Invalid rollout context budget: ROLLOUT_MAX_PROMPT_LEN + ROLLOUT_MAX_RESPONSE_LEN = $((ROLLOUT_MAX_PROMPT_LEN + ROLLOUT_MAX_RESPONSE_LEN)) must not exceed SGLANG_CONTEXT_LENGTH=${SGLANG_CONTEXT_LENGTH}." >&2
+    echo "Requested prompt budget ${ROLLOUT_MAX_PROMPT_LEN} and response budget ${ROLLOUT_MAX_RESPONSE_LEN} cannot fit into the configured rollout server context length." >&2
+    exit 1
+fi
+
+if (( EVAL_MAX_PROMPT_LEN + EVAL_MAX_RESPONSE_LEN > SGLANG_CONTEXT_LENGTH )); then
+    echo "Invalid eval context budget: EVAL_MAX_PROMPT_LEN + EVAL_MAX_RESPONSE_LEN = $((EVAL_MAX_PROMPT_LEN + EVAL_MAX_RESPONSE_LEN)) must not exceed SGLANG_CONTEXT_LENGTH=${SGLANG_CONTEXT_LENGTH}." >&2
+    echo "Requested eval prompt budget ${EVAL_MAX_PROMPT_LEN} and response budget ${EVAL_MAX_RESPONSE_LEN} cannot fit into the configured rollout server context length." >&2
     exit 1
 fi
 
@@ -500,6 +513,7 @@ ROLLOUT_ARGS=(
     --num-steps-per-rollout "${NUM_STEPS_PER_ROLLOUT}"
     --global-batch-size "${GLOBAL_BATCH_SIZE}"
     --rollout-max-prompt-len "${ROLLOUT_MAX_PROMPT_LEN}"
+    --rollout-max-context-len "${SGLANG_CONTEXT_LENGTH}"
     --rollout-max-response-len "${ROLLOUT_MAX_RESPONSE_LEN}"
     --rollout-temperature "${ROLLOUT_TEMPERATURE}"
     --rollout-top-p "${ROLLOUT_TOP_P}"
@@ -612,6 +626,9 @@ if [[ -n "${WANDB_API_KEY}" ]]; then
     fi
     if [[ -n "${WANDB_HOST}" ]]; then
         WANDB_ARGS+=(--wandb-host "${WANDB_HOST}")
+    fi
+    if [[ -n "${WANDB_RUN_ID}" ]]; then
+        WANDB_ARGS+=(--wandb-run-id "${WANDB_RUN_ID}")
     fi
 fi
 
