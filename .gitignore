@@ -178,6 +178,8 @@ settings.json
 .pypirc
 
 wandb/
+!tests/wandb/
+!tests/wandb/**
 outputs/
 local/
 **/rollout_data/

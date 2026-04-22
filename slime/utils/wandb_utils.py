@@ -1,10 +1,15 @@
 import logging
 import os
+import json
 from copy import deepcopy
 
 import wandb
 
+from .wandb_canonical import RuntimeStepAligner, normalize_step_targets
+
 logger = logging.getLogger(__name__)
+
+_WANDB_STATE_FILENAME = "slime_wandb_state.json"
 
 
 def _is_offline_mode(args) -> bool:
@@ -17,6 +22,98 @@ def _is_offline_mode(args) -> bool:
     if args.wandb_mode:
         return args.wandb_mode == "offline"
     return os.environ.get("WANDB_MODE") == "offline"
+
+
+def _get_wandb_state_path(args) -> str | None:
+    if not getattr(args, "wandb_dir", None):
+        return None
+    return os.path.join(args.wandb_dir, _WANDB_STATE_FILENAME)
+
+
+def _load_persisted_run_identity(args) -> dict | None:
+    state_path = _get_wandb_state_path(args)
+    if state_path is None or not os.path.exists(state_path):
+        return None
+
+    try:
+        with open(state_path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        logger.exception("Failed to load persisted W&B state from %s", state_path)
+        return None
+
+    if not isinstance(state, dict):
+        logger.warning("Ignoring non-dict W&B state in %s", state_path)
+        return None
+    return state
+
+
+def _load_step_targets_from_state(args, persisted_state: dict | None) -> dict[str, float]:
+    current_targets = getattr(args, "wandb_step_targets", None)
+    if persisted_state is None:
+        return normalize_step_targets(current_targets)
+    return normalize_step_targets(persisted_state.get("step_targets") or current_targets)
+
+
+def _persist_run_identity(args, *, group: str | None, run_name: str | None) -> None:
+    state_path = _get_wandb_state_path(args)
+    if state_path is None or wandb.run is None:
+        return
+
+    state = {
+        "run_id": wandb.run.id,
+        "group": group,
+        "run_name": run_name,
+        "project": getattr(args, "wandb_project", None),
+        "entity": getattr(args, "wandb_team", None),
+        "step_targets": normalize_step_targets(getattr(args, "wandb_step_targets", None)),
+    }
+    tmp_path = f"{state_path}.tmp"
+    try:
+        os.makedirs(os.path.dirname(state_path), exist_ok=True)
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=True, indent=2, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp_path, state_path)
+    except OSError:
+        logger.exception("Failed to persist W&B state to %s", state_path)
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            logger.exception("Failed to remove temporary W&B state file %s", tmp_path)
+
+
+def _compute_wandb_identity(args) -> tuple[str | None, str | None, str | None, str | None]:
+    if args.wandb_random_suffix:
+        group = args.wandb_group + "_" + wandb.util.generate_id()
+        run_name = f"{group}-RANK_{args.rank}"
+    else:
+        group = args.wandb_group
+        run_name = args.wandb_group
+
+    explicit_run_id = getattr(args, "wandb_run_id", None)
+    persisted_state = _load_persisted_run_identity(args)
+
+    if explicit_run_id:
+        if persisted_state and persisted_state.get("run_id") == explicit_run_id:
+            return (
+                explicit_run_id,
+                "must",
+                persisted_state.get("group") or group,
+                persisted_state.get("run_name") or run_name,
+            )
+        return explicit_run_id, "must", group, run_name
+
+    if persisted_state and persisted_state.get("run_id"):
+        return (
+            persisted_state["run_id"],
+            "must",
+            persisted_state.get("group") or group,
+            persisted_state.get("run_name") or run_name,
+        )
+
+    return None, None, group, run_name
 
 
 def init_wandb_primary(args):
@@ -40,14 +137,12 @@ def init_wandb_primary(args):
     if (not offline) and args.wandb_key is not None:
         wandb.login(key=args.wandb_key, host=args.wandb_host)
 
-    # Prepare wandb init parameters
-    # add random 6 length string with characters
-    if args.wandb_random_suffix:
-        group = args.wandb_group + "_" + wandb.util.generate_id()
-        run_name = f"{group}-RANK_{args.rank}"
-    else:
-        group = args.wandb_group
-        run_name = args.wandb_group
+    persisted_state = _load_persisted_run_identity(args)
+    explicit_run_id = getattr(args, "wandb_run_id", None)
+    args.wandb_step_targets = _load_step_targets_from_state(args, persisted_state)
+    if explicit_run_id and persisted_state and persisted_state.get("run_id") != explicit_run_id:
+        args.wandb_step_targets = {}
+    run_id, resume_mode, group, run_name = _compute_wandb_identity(args)
 
     # Prepare wandb init parameters
     init_kwargs = {
@@ -57,6 +152,10 @@ def init_wandb_primary(args):
         "name": run_name,
         "config": _compute_config_for_logging(args),
     }
+    if run_id is not None:
+        init_kwargs["id"] = run_id
+    if resume_mode is not None:
+        init_kwargs["resume"] = resume_mode
 
     # Configure settings based on offline/online mode
     if offline:
@@ -77,6 +176,7 @@ def init_wandb_primary(args):
 
     # Set wandb_run_id in args for easy access throughout the training process
     args.wandb_run_id = wandb.run.id
+    _persist_run_identity(args, group=group, run_name=run_name)
 
 
 def reinit_wandb_primary_with_open_metrics(args, router_addr):
@@ -133,6 +233,7 @@ def reinit_wandb_primary_with_open_metrics(args, router_addr):
 
     wandb.init(**init_kwargs)
     _init_wandb_common()
+    _persist_run_identity(args, group=None, run_name=None)
 
 
 def _compute_config_for_logging(args):
@@ -152,6 +253,7 @@ def init_wandb_secondary(args):
     wandb_run_id = getattr(args, "wandb_run_id", None)
     if wandb_run_id is None:
         return
+    args.wandb_step_targets = _load_step_targets_from_state(args, _load_persisted_run_identity(args))
 
     # Set W&B mode if specified (same as primary)
     if args.wandb_mode:
@@ -190,6 +292,18 @@ def init_wandb_secondary(args):
     wandb.init(**init_kwargs)
 
     _init_wandb_common()
+
+
+def prepare_metrics_for_wandb(args, metrics: dict):
+    step_targets = normalize_step_targets(getattr(args, "wandb_step_targets", None))
+    if not step_targets:
+        return metrics
+
+    aligner = getattr(args, "_wandb_runtime_step_aligner", None)
+    if aligner is None:
+        aligner = RuntimeStepAligner(step_targets)
+        setattr(args, "_wandb_runtime_step_aligner", aligner)
+    return aligner.apply(metrics)
 
 
 def _init_wandb_common():

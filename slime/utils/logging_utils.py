@@ -61,7 +61,12 @@ def build_lr_metrics(*, optimizer, opt_param_scheduler, metric_prefix: str) -> d
 # TODO further refactor, e.g. put TensorBoard init to the "init" part
 def log(args, metrics, step_key: str):
     if args.use_wandb:
-        wandb.log(metrics)
+        prepared_metrics = wandb_utils.prepare_metrics_for_wandb(args, metrics)
+        step_value = prepared_metrics.get(step_key)
+        if isinstance(step_value, (int, float)) and not isinstance(step_value, bool):
+            wandb.log(prepared_metrics, step=step_value)
+        else:
+            wandb.log(prepared_metrics)
 
     if args.use_tensorboard:
         metrics_except_step = {k: v for k, v in metrics.items() if k != step_key}
