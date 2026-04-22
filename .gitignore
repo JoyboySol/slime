@@ -180,6 +180,8 @@ settings.json
 wandb/
 !tests/wandb/
 !tests/wandb/**
+tests/wandb/__pycache__/
+tests/wandb/**/*.pyc
 outputs/
 local/
 **/rollout_data/
