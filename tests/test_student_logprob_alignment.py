@@ -35,6 +35,19 @@ from slime.rollout import sglang_rollout
 from slime.utils.types import Sample
 
 
+class BytePieceTokenizer:
+    def __init__(self, decode_map, token_piece_map):
+        self.decode_map = decode_map
+        self.token_piece_map = token_piece_map
+
+    def decode(self, token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False):
+        del skip_special_tokens, clean_up_tokenization_spaces
+        return "".join(self.decode_map[token_id] for token_id in token_ids)
+
+    def convert_ids_to_tokens(self, token_ids):
+        return [self.token_piece_map[token_id] for token_id in token_ids]
+
+
 def test_generate_keeps_rollout_log_probs_aligned_with_response_tokens_when_truncated(monkeypatch):
     captured_payload = {}
 
@@ -108,6 +121,68 @@ def test_generate_keeps_rollout_log_probs_aligned_with_response_tokens_when_trun
     assert len(updated.rollout_log_probs) == updated.response_length
     assert updated.tokens[-updated.response_length :] == [11, 12]
     assert captured_payload["return_text_in_logprobs"] is True
+    assert updated.status == Sample.Status.TRUNCATED
+
+
+def test_generate_trims_incomplete_truncated_utf8_suffix_before_opd_alignment(monkeypatch):
+    async def fake_post(url, payload, headers=None):
+        del url, payload, headers
+        return {
+            "text": "A\ufffd\ufffd",
+            "meta_info": {
+                "output_token_logprobs": [
+                    [-0.1, 11, "A"],
+                    [-0.2, 12, "\ufffd"],
+                    [-0.3, 13, "\ufffd"],
+                ],
+                "finish_reason": {"type": "length"},
+                "prompt_tokens": 1,
+                "completion_tokens": 3,
+            },
+        }
+
+    tokenizer = BytePieceTokenizer(
+        decode_map={101: "P", 11: "A", 12: "\ufffd", 13: "\ufffd"},
+        token_piece_map={101: "P", 11: "A", 12: "<0xE2>", 13: "<0x9F>"},
+    )
+
+    monkeypatch.setattr(
+        sglang_rollout,
+        "GenerateState",
+        lambda args: types.SimpleNamespace(tokenizer=tokenizer, processor=None),
+    )
+    monkeypatch.setattr(sglang_rollout, "_prepare_prompt_ids", lambda sample, tokenizer, processor: [101])
+    monkeypatch.setattr(sglang_rollout, "post", fake_post)
+
+    args = Namespace(
+        ci_test=False,
+        use_rollout_routing_replay=False,
+        sglang_router_ip="127.0.0.1",
+        sglang_router_port=30000,
+        partial_rollout=False,
+        mask_offpolicy_in_partial_rollout=False,
+        router_policy=None,
+        sglang_speculative_algorithm=None,
+    )
+    sample = Sample(prompt="hello")
+
+    updated = asyncio.run(
+        sglang_rollout.generate(
+            args,
+            sample,
+            sampling_params={"max_new_tokens": 3},
+        )
+    )
+
+    assert updated.tokens == [101, 11]
+    assert updated.response == "A"
+    assert updated.response_length == 1
+    assert updated.rollout_log_probs == [-0.1]
+    assert updated.opd_student_token_texts == ["A"]
+    assert updated.opd_generation_byte_evidence_attempted is True
+    assert updated.opd_generation_byte_evidence_complete is True
+    assert updated.opd_generation_byte_evidence_validated is True
+    assert updated.opd_generation_byte_evidence_error is None
     assert updated.status == Sample.Status.TRUNCATED
 
 

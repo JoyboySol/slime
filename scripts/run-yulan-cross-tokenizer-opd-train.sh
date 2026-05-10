@@ -17,8 +17,10 @@ MODEL_CONFIG_SCRIPT="${MODEL_CONFIG_SCRIPT:-}"
 PROMPT_DATA="${PROMPT_DATA:-/mnt/hdd/huanglisheng/train_data/G-OPD-Training-Data/DeepMath-103K/slime_style_train_data.jsonl}"
 EVAL_DATA_PATH="${EVAL_DATA_PATH:-/mnt/hdd/huanglisheng/train_data/G-OPD-Training-Data/AIME2024}"
 EVAL_DATASET_NAME="${EVAL_DATASET_NAME:-aime}"
+ENABLE_AIME_EVAL="${ENABLE_AIME_EVAL:-0}"
 MATH500_DATA_PATH="${MATH500_DATA_PATH:-/mnt/hdd/dongzican/math_500}"
 MATH500_EVAL_DATASET_NAME="${MATH500_EVAL_DATASET_NAME:-math500}"
+ENABLE_MATH500_EVAL="${ENABLE_MATH500_EVAL:-1}"
 MATH500_EVAL_SIZE="${MATH500_EVAL_SIZE:-500}"
 MATH500_EVAL_SEED="${MATH500_EVAL_SEED:-42}"
 
@@ -27,6 +29,7 @@ TEACHER_CUDA_VISIBLE_DEVICES="${TEACHER_CUDA_VISIBLE_DEVICES:-3}"
 ROLLOUT_CUDA_VISIBLE_DEVICES="${ROLLOUT_CUDA_VISIBLE_DEVICES:-}"
 NUM_GPUS="${NUM_GPUS:-3}"
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+MASTER_PORT="${MASTER_PORT:-12355}"
 SGLANG_PORT="${SGLANG_PORT:-30110}"
 TEACHER_PORT="${TEACHER_PORT:-30221}"
 REUSE_EXISTING_SERVERS="${REUSE_EXISTING_SERVERS:-0}"
@@ -93,6 +96,31 @@ export SGLANG_MAMBA_SSM_DTYPE="${SGLANG_MAMBA_SSM_DTYPE:-float32}"
 
 unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy
 export NO_PROXY="127.0.0.1,localhost,${MASTER_ADDR}"
+
+normalize_bool_flag() {
+    local raw_value="${1:-}"
+    local normalized_value="${raw_value,,}"
+
+    case "${normalized_value}" in
+        1|true|yes|on)
+            printf '1\n'
+            ;;
+        0|false|no|off)
+            printf '0\n'
+            ;;
+        *)
+            echo "Invalid boolean flag value: ${raw_value}. Expected one of 1/0, true/false, yes/no, on/off." >&2
+            exit 1
+            ;;
+    esac
+}
+
+ENABLE_AIME_EVAL="$(normalize_bool_flag "${ENABLE_AIME_EVAL}")"
+ENABLE_MATH500_EVAL="$(normalize_bool_flag "${ENABLE_MATH500_EVAL}")"
+EVAL_ENABLED=0
+if [[ "${ENABLE_AIME_EVAL}" == "1" || "${ENABLE_MATH500_EVAL}" == "1" ]]; then
+    EVAL_ENABLED=1
+fi
 
 resolve_eval_path() {
     local raw_path="$1"
@@ -291,21 +319,29 @@ PY
 
 write_eval_config() {
     local config_path="$1"
-    local aime_path="$2"
-    local math500_path="$3"
 
-    cat >"${config_path}" <<EOF
-eval:
-  datasets:
+    {
+        echo "eval:"
+        echo "  datasets:"
+
+        if [[ "${ENABLE_AIME_EVAL}" == "1" ]]; then
+            cat <<EOF
     - name: ${EVAL_DATASET_NAME}
-      path: ${aime_path}
+      path: ${EVAL_PROMPT_DATA}
       input_key: prompt
       label_key: reward_model
+EOF
+        fi
+
+        if [[ "${ENABLE_MATH500_EVAL}" == "1" ]]; then
+            cat <<EOF
     - name: ${MATH500_EVAL_DATASET_NAME}
-      path: ${math500_path}
+      path: ${MATH500_SUBSET_PATH}
       input_key: problem
       label_key: answer
 EOF
+        fi
+    } >"${config_path}"
 }
 
 get_student_rope_theta() {
@@ -336,18 +372,29 @@ if [[ ! -f "${PROMPT_DATA}" ]]; then
     exit 1
 fi
 
-if ! EVAL_PROMPT_DATA="$(resolve_eval_path "${EVAL_DATA_PATH}")"; then
-    echo "Eval data path not found or no supported file discovered under: ${EVAL_DATA_PATH}" >&2
-    exit 1
+EVAL_PROMPT_DATA=""
+if [[ "${ENABLE_AIME_EVAL}" == "1" ]]; then
+    if ! EVAL_PROMPT_DATA="$(resolve_eval_path "${EVAL_DATA_PATH}")"; then
+        echo "Eval data path not found or no supported file discovered under: ${EVAL_DATA_PATH}" >&2
+        exit 1
+    fi
 fi
 
-if ! MATH500_PROMPT_DATA="$(resolve_eval_path "${MATH500_DATA_PATH}")"; then
-    echo "Math-500 data path not found or no supported file discovered under: ${MATH500_DATA_PATH}" >&2
-    exit 1
+MATH500_PROMPT_DATA=""
+if [[ "${ENABLE_MATH500_EVAL}" == "1" ]]; then
+    if ! MATH500_PROMPT_DATA="$(resolve_eval_path "${MATH500_DATA_PATH}")"; then
+        echo "Math-500 data path not found or no supported file discovered under: ${MATH500_DATA_PATH}" >&2
+        exit 1
+    fi
+
+    create_jsonl_subset "${MATH500_PROMPT_DATA}" "${MATH500_SUBSET_PATH}" "${MATH500_EVAL_SIZE}" "${MATH500_EVAL_SEED}"
 fi
 
-create_jsonl_subset "${MATH500_PROMPT_DATA}" "${MATH500_SUBSET_PATH}" "${MATH500_EVAL_SIZE}" "${MATH500_EVAL_SEED}"
-write_eval_config "${EVAL_CONFIG_PATH}" "${EVAL_PROMPT_DATA}" "${MATH500_SUBSET_PATH}"
+if [[ "${EVAL_ENABLED}" == "1" ]]; then
+    write_eval_config "${EVAL_CONFIG_PATH}"
+else
+    rm -f "${EVAL_CONFIG_PATH}"
+fi
 
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l || true)
 if [[ "${NVLINK_COUNT}" -gt 0 ]]; then
@@ -404,16 +451,32 @@ echo "[0/9] Settings"
 echo "  STUDENT_MODEL_PATH=${STUDENT_MODEL_PATH}"
 echo "  TEACHER_MODEL_PATH=${TEACHER_MODEL_PATH}"
 echo "  PROMPT_DATA=${PROMPT_DATA}"
-echo "  EVAL_PROMPT_DATA=${EVAL_PROMPT_DATA}"
-echo "  MATH500_PROMPT_DATA=${MATH500_PROMPT_DATA}"
-echo "  MATH500_SUBSET_PATH=${MATH500_SUBSET_PATH}"
-echo "  EVAL_CONFIG_PATH=${EVAL_CONFIG_PATH}"
+echo "  ENABLE_AIME_EVAL=${ENABLE_AIME_EVAL}"
+echo "  ENABLE_MATH500_EVAL=${ENABLE_MATH500_EVAL}"
+if [[ "${ENABLE_AIME_EVAL}" == "1" ]]; then
+    echo "  EVAL_PROMPT_DATA=${EVAL_PROMPT_DATA}"
+else
+    echo "  EVAL_PROMPT_DATA=<disabled>"
+fi
+if [[ "${ENABLE_MATH500_EVAL}" == "1" ]]; then
+    echo "  MATH500_PROMPT_DATA=${MATH500_PROMPT_DATA}"
+    echo "  MATH500_SUBSET_PATH=${MATH500_SUBSET_PATH}"
+else
+    echo "  MATH500_PROMPT_DATA=<disabled>"
+    echo "  MATH500_SUBSET_PATH=<disabled>"
+fi
+if [[ "${EVAL_ENABLED}" == "1" ]]; then
+    echo "  EVAL_CONFIG_PATH=${EVAL_CONFIG_PATH}"
+else
+    echo "  EVAL_CONFIG_PATH=<disabled>"
+fi
 echo "  TRAIN_CUDA_VISIBLE_DEVICES=${TRAIN_CUDA_VISIBLE_DEVICES}"
 echo "  TEACHER_CUDA_VISIBLE_DEVICES=${TEACHER_CUDA_VISIBLE_DEVICES}"
 echo "  ROLLOUT_CUDA_VISIBLE_DEVICES=${ROLLOUT_CUDA_VISIBLE_DEVICES:-<empty>}"
 echo "  RAY_CUDA_VISIBLE_DEVICES=${RAY_CUDA_VISIBLE_DEVICES}"
 echo "  RAY_NUM_GPUS=${RAY_NUM_GPUS}"
 echo "  ROLLOUT_NUM_GPUS_EFFECTIVE=${ROLLOUT_NUM_GPUS_EFFECTIVE}"
+echo "  MASTER_PORT=${MASTER_PORT}"
 echo "  WORK_DIR=${WORK_DIR}"
 echo "  WORK_DIR_LINK_PATH=${WORK_DIR_LINK_PATH}"
 echo "  WANDB_MODE=${WANDB_MODE}"
@@ -455,7 +518,7 @@ fi
 echo "[3/9] Convert student HF checkpoint to Megatron torch_dist if needed"
 if [[ ! -f "${REF_LOAD}/latest_checkpointed_iteration.txt" ]]; then
     CUDA_VISIBLE_DEVICES="${TRAIN_CUDA_VISIBLE_DEVICES}" \
-    torchrun --nproc-per-node "${NUM_GPUS}" \
+    torchrun --nproc-per-node "${NUM_GPUS}" --master-port "${MASTER_PORT}" \
         "${SLIME_DIR}/tools/convert_hf_to_torch_dist.py" \
         "${MODEL_ARGS[@]}" \
         --hf-checkpoint "${STUDENT_MODEL_PATH}" \
@@ -540,14 +603,17 @@ if [[ "${OPD_DISABLE_SEQUENCE_FALLBACK}" == "true" ]]; then
     OPD_ARGS+=(--opd-disable-sequence-fallback)
 fi
 
-EVAL_ARGS=(
-    --eval-interval "${EVAL_INTERVAL}"
-    --eval-config "${EVAL_CONFIG_PATH}"
-    --skip-eval-before-train
-    --n-samples-per-eval-prompt "${N_SAMPLES_PER_EVAL_PROMPT}"
-    --eval-max-prompt-len "${EVAL_MAX_PROMPT_LEN}"
-    --eval-max-response-len "${EVAL_MAX_RESPONSE_LEN}"
-)
+EVAL_ARGS=()
+if [[ "${EVAL_ENABLED}" == "1" ]]; then
+    EVAL_ARGS=(
+        --eval-interval "${EVAL_INTERVAL}"
+        --eval-config "${EVAL_CONFIG_PATH}"
+        # --skip-eval-before-train
+        --n-samples-per-eval-prompt "${N_SAMPLES_PER_EVAL_PROMPT}"
+        --eval-max-prompt-len "${EVAL_MAX_PROMPT_LEN}"
+        --eval-max-response-len "${EVAL_MAX_RESPONSE_LEN}"
+    )
+fi
 
 PERF_ARGS=(
     --tensor-model-parallel-size 1

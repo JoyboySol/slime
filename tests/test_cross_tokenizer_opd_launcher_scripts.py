@@ -12,6 +12,7 @@ def test_train_launcher_supports_reuse_existing_servers_mode():
     text = _read_script("run-yulan-cross-tokenizer-opd-train.sh")
 
     assert 'REUSE_EXISTING_SERVERS="${REUSE_EXISTING_SERVERS:-0}"' in text
+    assert 'MASTER_PORT="${MASTER_PORT:-12355}"' in text
     assert 'if [[ "${REUSE_EXISTING_SERVERS}" != "1" ]]; then' in text
     assert '--rollout-external' in text
     assert 'ROLLOUT_EXTERNAL_ENGINE_ADDRS' in text
@@ -22,6 +23,8 @@ def test_train_launcher_supports_reuse_existing_servers_mode():
     assert 'must not exceed SGLANG_CONTEXT_LENGTH' in text
     assert 'WANDB_RUN_ID="${WANDB_RUN_ID:-}"' in text
     assert 'WANDB_ARGS+=(--wandb-run-id "${WANDB_RUN_ID}")' in text
+    assert 'echo "  MASTER_PORT=${MASTER_PORT}"' in text
+    assert 'torchrun --nproc-per-node "${NUM_GPUS}" --master-port "${MASTER_PORT}" \\' in text
 
 
 def test_smoke_launcher_supports_reuse_existing_servers_mode():

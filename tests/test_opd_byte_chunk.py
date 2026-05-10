@@ -302,6 +302,24 @@ def test_build_recorded_student_response_alignment_from_token_ids_supports_hex_b
     assert token_spans == [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6)]
 
 
+def test_build_recorded_student_response_alignment_from_token_ids_maps_invalid_hex_byte_to_replacement_char():
+    tokenizer = SentencePieceLikeTokenizer(
+        token_map={10: "A", 11: "�", 12: "B"},
+        encode_map={"A�B": [10, 11, 12]},
+        token_piece_map={10: "A", 11: "<0x86>", 12: "B"},
+        offsets_map={"A�B": [(0, 1), (1, 2), (2, 3)]},
+    )
+
+    response_bytes, token_spans = opd_utils.build_recorded_student_response_alignment_from_token_ids(
+        tokenizer=tokenizer,
+        response_text="A�B",
+        response_token_ids=[10, 11, 12],
+    )
+
+    assert response_bytes == "A�B".encode("utf-8")
+    assert token_spans == [(0, 1), (1, 4), (4, 5)]
+
+
 def test_validate_recorded_student_response_alignment_accepts_valid_payload():
     token_bytes, token_spans = opd_utils.validate_recorded_student_response_alignment(
         response_text="AB",
@@ -1445,6 +1463,10 @@ def test_record_student_opd_alignment_marks_failed_recording_metadata(monkeypatc
         "slime.rollout.on_policy_distillation.build_recorded_student_response_alignment_from_token_ids",
         lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("boom-token-ids")),
     )
+    monkeypatch.setattr(
+        "slime.rollout.on_policy_distillation.build_recorded_student_response_alignment",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("boom-full-sequence")),
+    )
 
     _record_student_opd_alignment(sample, student_tokenizer)
 
@@ -1454,7 +1476,7 @@ def test_record_student_opd_alignment_marks_failed_recording_metadata(monkeypatc
     assert sample.opd_student_alignment_complete is False
     assert sample.opd_student_alignment_validated is False
     assert sample.opd_student_alignment_status == "recorded_missing"
-    assert sample.opd_student_alignment_error == "boom-token-ids"
+    assert sample.opd_student_alignment_error == "boom-full-sequence"
     assert sample.opd_student_alignment_metadata == {
         "response_token_count": 2,
         "generation_token_text_count": None,
@@ -1509,6 +1531,10 @@ def test_record_student_opd_alignment_marks_failure_when_token_id_builder_fails(
         "slime.rollout.on_policy_distillation.build_recorded_student_response_alignment_from_token_ids",
         lambda **kwargs: (_ for _ in ()).throw(ValueError("token-id failed")),
     )
+    monkeypatch.setattr(
+        "slime.rollout.on_policy_distillation.build_recorded_student_response_alignment",
+        lambda tokenizer, **kwargs: (_ for _ in ()).throw(ValueError("full-sequence failed")),
+    )
 
     _record_student_opd_alignment(sample, student_tokenizer)
 
@@ -1517,11 +1543,49 @@ def test_record_student_opd_alignment_marks_failure_when_token_id_builder_fails(
     assert sample.opd_student_alignment_source == "recorded_builder"
     assert sample.opd_student_alignment_complete is False
     assert sample.opd_student_alignment_validated is False
-    assert sample.opd_student_alignment_error == "token-id failed"
+    assert sample.opd_student_alignment_error == "full-sequence failed"
     assert sample.opd_student_alignment_metadata == {
         "response_token_count": 2,
         "generation_token_text_count": None,
         "evidence_kind": "recorded_builder_failed",
+    }
+
+
+def test_record_student_opd_alignment_falls_back_to_contextual_recorded_builder_when_token_id_builder_fails(monkeypatch):
+    sample = Sample(
+        tokens=[1, 2, 3],
+        response_length=2,
+        opd_prompt_text="PROMPT",
+        opd_response_text="AB",
+        opd_full_text="PROMPTAB",
+    )
+    student_tokenizer = BoundaryAwareTokenizer(
+        token_map={1: "PROMPT", 2: "A", 3: "B"},
+        encode_map={"PROMPTAB": [1, 2, 3], "AB": [2, 3]},
+    )
+
+    monkeypatch.setattr(
+        "slime.rollout.on_policy_distillation.build_recorded_student_response_alignment_from_token_ids",
+        lambda **kwargs: (_ for _ in ()).throw(ValueError("token-id failed")),
+    )
+    monkeypatch.setattr(
+        "slime.rollout.on_policy_distillation.build_recorded_student_response_alignment",
+        lambda tokenizer, **kwargs: (b"AB", [(0, 1), (1, 2)]),
+        raising=False,
+    )
+
+    _record_student_opd_alignment(sample, student_tokenizer)
+
+    assert sample.opd_student_response_bytes == [65, 66]
+    assert sample.opd_student_token_byte_spans == [[0, 1], [1, 2]]
+    assert sample.opd_student_alignment_source == "recorded_builder"
+    assert sample.opd_student_alignment_complete is True
+    assert sample.opd_student_alignment_validated is True
+    assert sample.opd_student_alignment_error is None
+    assert sample.opd_student_alignment_metadata == {
+        "response_token_count": 2,
+        "response_byte_length": 2,
+        "evidence_kind": "recorded_builder_full_sequence",
     }
 
 

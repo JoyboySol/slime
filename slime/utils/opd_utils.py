@@ -13,6 +13,7 @@ from slime.utils.processing_utils import load_tokenizer
 logger = logging.getLogger(__name__)
 _BYTE_LEVEL_CHAR_TO_BYTE = {v: k for k, v in bytes_to_unicode().items()}
 _HEX_BYTE_TOKEN_RE = re.compile(r"^<0x([0-9A-Fa-f]{2})>$")
+_UTF8_REPLACEMENT_BYTES = b"\xef\xbf\xbd"
 
 
 @lru_cache(maxsize=8)
@@ -259,6 +260,30 @@ def _token_piece_candidates(token_piece: str) -> list[bytes]:
     return deduped
 
 
+def _hex_byte_token_value(token_piece: str) -> int | None:
+    hex_match = _HEX_BYTE_TOKEN_RE.match(token_piece)
+    if hex_match is None:
+        return None
+    return int(hex_match.group(1), 16)
+
+
+def _is_invalid_standalone_utf8_byte(byte_value: int) -> bool:
+    return 0x80 <= byte_value <= 0xC1 or byte_value >= 0xF5
+
+
+def _replacement_candidate_for_isolated_invalid_byte_token(
+    token_pieces: list[str], index: int
+) -> bytes | None:
+    byte_value = _hex_byte_token_value(token_pieces[index])
+    if byte_value is None or not _is_invalid_standalone_utf8_byte(byte_value):
+        return None
+    if index > 0 and _hex_byte_token_value(token_pieces[index - 1]) is not None:
+        return None
+    if index + 1 < len(token_pieces) and _hex_byte_token_value(token_pieces[index + 1]) is not None:
+        return None
+    return _UTF8_REPLACEMENT_BYTES
+
+
 def _build_token_byte_spans_via_token_strings(
     tokenizer, text: str, token_ids: list[int]
 ) -> tuple[list[bytes], list[tuple[int, int]]]:
@@ -275,8 +300,12 @@ def _build_token_byte_spans_via_token_strings(
     byte_offset = 0
     for index, token_piece in enumerate(token_pieces):
         remaining = target_bytes[byte_offset:]
+        candidates = _token_piece_candidates(token_piece)
+        replacement_candidate = _replacement_candidate_for_isolated_invalid_byte_token(token_pieces, index)
+        if replacement_candidate is not None:
+            candidates.append(replacement_candidate)
         matching_candidates = [
-            candidate for candidate in _token_piece_candidates(token_piece) if remaining.startswith(candidate)
+            candidate for candidate in candidates if remaining.startswith(candidate)
         ]
         if not matching_candidates:
             raise ValueError(

@@ -27,7 +27,11 @@ from slime.utils.processing_utils import (
     load_processor,
     load_tokenizer,
 )
-from slime.utils.opd_utils import build_generation_byte_evidence_observability
+from slime.utils.opd_utils import (
+    build_generation_byte_evidence_observability,
+    build_recorded_student_response_alignment_from_token_ids,
+    decode_token_ids,
+)
 from slime.utils.trace_utils import build_sglang_meta_trace_attrs, trace_function, trace_span
 from slime.utils.types import Sample
 
@@ -39,6 +43,62 @@ __all__ = ["generate_rollout", "get_model_url"]
 logger = logging.getLogger(__name__)
 
 _PROCESSOR_PROMPT_KEYS = {"input_ids", "attention_mask"}
+
+
+def _trim_incomplete_truncated_response_suffix(sample: Sample, tokenizer, *, max_trim_tokens: int = 4) -> None:
+    if sample.response_length <= 0:
+        return
+    if not hasattr(tokenizer, "convert_ids_to_tokens"):
+        return
+
+    response_token_ids = sample.tokens[-sample.response_length :]
+    if not response_token_ids:
+        return
+
+    try:
+        build_recorded_student_response_alignment_from_token_ids(
+            tokenizer=tokenizer,
+            response_text=sample.response,
+            response_token_ids=response_token_ids,
+        )
+        return
+    except ValueError:
+        pass
+
+    trim_limit = min(max_trim_tokens, len(response_token_ids))
+    tail_token_pieces = tokenizer.convert_ids_to_tokens(response_token_ids[-trim_limit:])
+    if not any(isinstance(piece, str) and piece.startswith("<0x") and piece.endswith(">") for piece in tail_token_pieces):
+        return
+
+    for trim_count in range(1, trim_limit + 1):
+        trimmed_response_token_ids = response_token_ids[:-trim_count]
+        trimmed_response_text = decode_token_ids(tokenizer, trimmed_response_token_ids)
+
+        try:
+            build_recorded_student_response_alignment_from_token_ids(
+                tokenizer=tokenizer,
+                response_text=trimmed_response_text,
+                response_token_ids=trimmed_response_token_ids,
+            )
+        except ValueError:
+            continue
+
+        sample.tokens = sample.tokens[:-trim_count]
+        sample.response_length -= trim_count
+        sample.response = trimmed_response_text
+        if sample.rollout_log_probs is not None:
+            sample.rollout_log_probs = sample.rollout_log_probs[:-trim_count]
+        if sample.loss_mask is not None:
+            sample.loss_mask = sample.loss_mask[:-trim_count]
+        if sample.opd_student_token_texts is not None:
+            sample.opd_student_token_texts = sample.opd_student_token_texts[:-trim_count]
+        if sample.rollout_routed_experts is not None:
+            sample.rollout_routed_experts = sample.rollout_routed_experts[:-trim_count]
+        logger.info(
+            "Trimmed %s trailing response token(s) from truncated sample to recover a complete UTF-8 suffix.",
+            trim_count,
+        )
+        return
 
 
 def _update_generation_byte_evidence(
@@ -260,6 +320,7 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         new_response_token_texts = [item[2] for item in output["meta_info"]["output_token_logprobs"] if len(item) >= 3]
     else:
         new_response_tokens, new_response_log_probs, new_response_token_texts = [], [], []
+    completion_reason = output["meta_info"].get("finish_reason", {}).get("type")
 
     # Update sample with tokens directly - avoiding re-tokenization
     sample.tokens = sample.tokens + new_response_tokens
@@ -278,8 +339,6 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         if sample.opd_student_token_texts is None:
             sample.opd_student_token_texts = []
         sample.opd_student_token_texts += new_response_token_texts
-        completion_reason = output["meta_info"].get("finish_reason", {}).get("type")
-        _update_generation_byte_evidence(sample, completion_reason=completion_reason)
 
     if "routed_experts" in output["meta_info"]:
         sample.rollout_routed_experts = np.frombuffer(
@@ -292,6 +351,12 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         )
 
     sample.update_from_meta_info(args, output["meta_info"])
+
+    if completion_reason == "length":
+        _trim_incomplete_truncated_response_suffix(sample, state.tokenizer)
+
+    if len(new_response_token_texts) == len(new_response_tokens):
+        _update_generation_byte_evidence(sample, completion_reason=completion_reason)
 
     return sample
 

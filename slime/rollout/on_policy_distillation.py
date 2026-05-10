@@ -5,6 +5,7 @@ import torch
 from slime.utils.processing_utils import encode_image_for_rollout_engine
 from slime.utils.opd_utils import (
     build_generation_byte_evidence_observability,
+    build_recorded_student_response_alignment,
     build_recorded_student_response_alignment_from_token_ids,
     build_token_byte_spans,
     clip_token_bytes_by_region,
@@ -237,6 +238,7 @@ def _record_student_opd_alignment(sample: Sample, student_tokenizer) -> None:
 
     try:
         alignment_source = "recorded_builder"
+        alignment_evidence_kind = "recorded_builder_token_ids"
         generation_token_text_count = len(sample.opd_student_token_texts) if sample.opd_student_token_texts is not None else None
         if sample.opd_student_token_texts is not None:
             if sample.opd_generation_byte_evidence_attempted is None:
@@ -254,11 +256,23 @@ def _record_student_opd_alignment(sample: Sample, student_tokenizer) -> None:
             if sample.opd_generation_byte_evidence_attempted is None:
                 sample.opd_generation_byte_evidence_attempted = False
 
-        response_bytes, response_spans = build_recorded_student_response_alignment_from_token_ids(
-            tokenizer=student_tokenizer,
-            response_text=sample.opd_response_text,
-            response_token_ids=sample.tokens[-sample.response_length :],
-        )
+        try:
+            response_bytes, response_spans = build_recorded_student_response_alignment_from_token_ids(
+                tokenizer=student_tokenizer,
+                response_text=sample.opd_response_text,
+                response_token_ids=sample.tokens[-sample.response_length :],
+            )
+        except Exception:
+            prompt_token_count = len(sample.tokens) - sample.response_length
+            response_bytes, response_spans = build_recorded_student_response_alignment(
+                student_tokenizer,
+                full_token_ids=sample.tokens,
+                prompt_token_count=prompt_token_count,
+                prompt_text=sample.opd_prompt_text,
+                response_text=sample.opd_response_text,
+                full_text=sample.opd_full_text,
+            )
+            alignment_evidence_kind = "recorded_builder_full_sequence"
         sample.opd_student_response_bytes = list(response_bytes)
         sample.opd_student_token_byte_spans = [list(span) for span in response_spans]
         sample.opd_student_alignment_version = 1
@@ -270,7 +284,7 @@ def _record_student_opd_alignment(sample: Sample, student_tokenizer) -> None:
         alignment_metadata = base_alignment_metadata | {
             "response_token_count": sample.response_length,
             "response_byte_length": len(response_bytes),
-            "evidence_kind": "recorded_builder_token_ids",
+            "evidence_kind": alignment_evidence_kind,
         }
         if generation_token_text_count is not None:
             alignment_metadata["generation_token_text_count"] = generation_token_text_count
