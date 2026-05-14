@@ -6,6 +6,7 @@ from copy import deepcopy
 import wandb
 
 from .wandb_canonical import RuntimeStepAligner, normalize_step_targets
+from .wandb_canonical import build_uniform_step_targets, filter_loggable_history_row, row_within_max_steps
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,8 @@ def _get_wandb_state_path(args) -> str | None:
 
 
 def _load_persisted_run_identity(args) -> dict | None:
+    if getattr(args, "wandb_start_fresh", False):
+        return None
     state_path = _get_wandb_state_path(args)
     if state_path is None or not os.path.exists(state_path):
         return None
@@ -50,6 +53,8 @@ def _load_persisted_run_identity(args) -> dict | None:
 
 def _load_step_targets_from_state(args, persisted_state: dict | None) -> dict[str, float]:
     current_targets = getattr(args, "wandb_step_targets", None)
+    if getattr(args, "wandb_start_fresh", False):
+        return normalize_step_targets(current_targets)
     if persisted_state is None:
         return normalize_step_targets(current_targets)
     return normalize_step_targets(persisted_state.get("step_targets") or current_targets)
@@ -116,6 +121,77 @@ def _compute_wandb_identity(args) -> tuple[str | None, str | None, str | None, s
     return None, None, group, run_name
 
 
+def _validate_wandb_resume_from_step(args, run_id: str | None) -> None:
+    resume_from_step = getattr(args, "wandb_resume_from_step", None)
+    if resume_from_step is None:
+        return
+    if run_id is None and not getattr(args, "wandb_start_fresh", False):
+        raise ValueError("--wandb-resume-from-step requires --wandb-run-id or a persisted W&B run id.")
+    if resume_from_step < 0:
+        raise ValueError("--wandb-resume-from-step must be non-negative.")
+
+
+def _resolve_wandb_run_path(args, run_id: str) -> str | None:
+    project = getattr(args, "wandb_project", None)
+    if not project:
+        return None
+    entity = getattr(args, "wandb_team", None)
+    return f"{entity}/{project}/{run_id}" if entity else f"{project}/{run_id}"
+
+
+def _load_wandb_backfill_rows(args, source_run_id: str, max_step: int | float) -> list[dict]:
+    project = getattr(args, "wandb_project", None)
+    if not project:
+        logger.warning("Skipping W&B history backfill because --wandb-project is not set.")
+        return []
+
+    max_step_targets = build_uniform_step_targets(("train/step", "rollout/step", "eval/step"), float(max_step))
+    try:
+        api = wandb.Api(timeout=int(os.environ.get("WANDB_PUBLIC_API_TIMEOUT", "60")))
+        run_path = _resolve_wandb_run_path(args, source_run_id)
+        if run_path is None:
+            entity = api.default_entity
+            run_path = f"{entity}/{project}/{source_run_id}" if entity else f"{project}/{source_run_id}"
+        rows = []
+        for row in api.run(run_path).scan_history():
+            if not row_within_max_steps(row, max_step_targets):
+                continue
+            filtered = filter_loggable_history_row(row)
+            if filtered:
+                rows.append(filtered)
+        return rows
+    except Exception:
+        logger.exception("Failed to load W&B history backfill rows from %s", run_path)
+        return []
+
+
+def _backfill_wandb_history_if_needed(args, source_run_id: str | None) -> None:
+    if not getattr(args, "wandb_start_fresh", False):
+        return
+    resume_from_step = getattr(args, "wandb_resume_from_step", None)
+    if resume_from_step is None or not source_run_id:
+        return
+
+    rows = _load_wandb_backfill_rows(args, source_run_id, resume_from_step)
+    if not rows:
+        logger.warning(
+            "No W&B history rows were backfilled from run %s up to step %s.",
+            source_run_id,
+            resume_from_step,
+        )
+        return
+
+    logger.info(
+        "Backfilling %d W&B history rows from run %s up to step %s into fresh run %s.",
+        len(rows),
+        source_run_id,
+        resume_from_step,
+        wandb.run.id if wandb.run is not None else "<unknown>",
+    )
+    for row in rows:
+        wandb.log(row)
+
+
 def init_wandb_primary(args):
     if not args.use_wandb:
         args.wandb_run_id = None
@@ -139,10 +215,17 @@ def init_wandb_primary(args):
 
     persisted_state = _load_persisted_run_identity(args)
     explicit_run_id = getattr(args, "wandb_run_id", None)
+    backfill_source_run_id = explicit_run_id
+    if getattr(args, "wandb_start_fresh", False):
+        if explicit_run_id is not None:
+            logger.info("Using explicit --wandb-run-id as W&B history backfill source because --wandb-start-fresh was requested.")
+        explicit_run_id = None
+        args.wandb_run_id = None
     args.wandb_step_targets = _load_step_targets_from_state(args, persisted_state)
     if explicit_run_id and persisted_state and persisted_state.get("run_id") != explicit_run_id:
         args.wandb_step_targets = {}
     run_id, resume_mode, group, run_name = _compute_wandb_identity(args)
+    _validate_wandb_resume_from_step(args, run_id)
 
     # Prepare wandb init parameters
     init_kwargs = {
@@ -176,6 +259,7 @@ def init_wandb_primary(args):
 
     # Set wandb_run_id in args for easy access throughout the training process
     args.wandb_run_id = wandb.run.id
+    _backfill_wandb_history_if_needed(args, backfill_source_run_id)
     _persist_run_identity(args, group=group, run_name=run_name)
 
 

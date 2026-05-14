@@ -320,6 +320,24 @@ def test_build_recorded_student_response_alignment_from_token_ids_maps_invalid_h
     assert token_spans == [(0, 1), (1, 4), (4, 5)]
 
 
+def test_build_recorded_student_response_alignment_from_token_ids_maps_isolated_utf8_start_byte_to_replacement_char():
+    tokenizer = SentencePieceLikeTokenizer(
+        token_map={10: "A", 11: "�", 12: "_", 13: "p"},
+        encode_map={"A�_p": [10, 11, 12, 13]},
+        token_piece_map={10: "A", 11: "<0xF0>", 12: "_", 13: "p"},
+        offsets_map={"A�_p": [(0, 1), (1, 2), (2, 3), (3, 4)]},
+    )
+
+    response_bytes, token_spans = opd_utils.build_recorded_student_response_alignment_from_token_ids(
+        tokenizer=tokenizer,
+        response_text="A�_p",
+        response_token_ids=[10, 11, 12, 13],
+    )
+
+    assert response_bytes == "A�_p".encode("utf-8")
+    assert token_spans == [(0, 1), (1, 4), (4, 5), (5, 6)]
+
+
 def test_validate_recorded_student_response_alignment_accepts_valid_payload():
     token_bytes, token_spans = opd_utils.validate_recorded_student_response_alignment(
         response_text="AB",

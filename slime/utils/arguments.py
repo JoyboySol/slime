@@ -1111,6 +1111,24 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Whether to turn on passrate logging, which will log the pass@n of the responses in the rollout.",
             )
             parser.add_argument("--wandb-run-id", type=str, default=None)
+            parser.add_argument(
+                "--wandb-start-fresh",
+                action="store_true",
+                default=False,
+                help=(
+                    "Start a brand-new W&B run even when resuming training from a checkpoint. "
+                    "This ignores any persisted W&B run identity in --wandb-dir."
+                ),
+            )
+            parser.add_argument(
+                "--wandb-resume-from-step",
+                type=int,
+                default=None,
+                help=(
+                    "If set with --wandb-run-id, resume logging from the given internal _step "
+                    "after restoring the existing W&B run."
+                ),
+            )
             return parser
 
         # tensorboard

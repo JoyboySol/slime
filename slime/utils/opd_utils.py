@@ -267,15 +267,17 @@ def _hex_byte_token_value(token_piece: str) -> int | None:
     return int(hex_match.group(1), 16)
 
 
-def _is_invalid_standalone_utf8_byte(byte_value: int) -> bool:
-    return 0x80 <= byte_value <= 0xC1 or byte_value >= 0xF5
+def _is_non_ascii_byte(byte_value: int) -> bool:
+    return 0x80 <= byte_value <= 0xFF
 
 
-def _replacement_candidate_for_isolated_invalid_byte_token(
+def _replacement_candidate_for_isolated_hex_byte_token(
     token_pieces: list[str], index: int
 ) -> bytes | None:
     byte_value = _hex_byte_token_value(token_pieces[index])
-    if byte_value is None or not _is_invalid_standalone_utf8_byte(byte_value):
+    if byte_value is None or not _is_non_ascii_byte(byte_value):
+        return None
+    if index + 1 == len(token_pieces):
         return None
     if index > 0 and _hex_byte_token_value(token_pieces[index - 1]) is not None:
         return None
@@ -301,8 +303,8 @@ def _build_token_byte_spans_via_token_strings(
     for index, token_piece in enumerate(token_pieces):
         remaining = target_bytes[byte_offset:]
         candidates = _token_piece_candidates(token_piece)
-        replacement_candidate = _replacement_candidate_for_isolated_invalid_byte_token(token_pieces, index)
-        if replacement_candidate is not None:
+        replacement_candidate = _replacement_candidate_for_isolated_hex_byte_token(token_pieces, index)
+        if replacement_candidate is not None and remaining.startswith(replacement_candidate):
             candidates.append(replacement_candidate)
         matching_candidates = [
             candidate for candidate in candidates if remaining.startswith(candidate)

@@ -14,7 +14,7 @@ WORK_DIR_LINK_PATH="${WORK_DIR_LINK_PATH:-${WORK_DIR_LINK_DIR}/$(basename "${WOR
 STUDENT_MODEL_PATH="${STUDENT_MODEL_PATH:-/mnt/hdd/lvzhihao/hf_models/YuLan-Mini-Nanbeige-Distill}"
 TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-/mnt/hdd/Nanbeige4.1-3B}"
 MODEL_CONFIG_SCRIPT="${MODEL_CONFIG_SCRIPT:-}"
-PROMPT_DATA="${PROMPT_DATA:-/mnt/hdd/huanglisheng/train_data/G-OPD-Training-Data/DeepMath-103K/slime_style_train_data.jsonl}"
+PROMPT_DATA="${PROMPT_DATA:-/mnt/hdd/lvzhihao/data/MATH-lighteval/data/train.jsonl}"
 EVAL_DATA_PATH="${EVAL_DATA_PATH:-/mnt/hdd/huanglisheng/train_data/G-OPD-Training-Data/AIME2024}"
 EVAL_DATASET_NAME="${EVAL_DATASET_NAME:-aime}"
 ENABLE_AIME_EVAL="${ENABLE_AIME_EVAL:-0}"
@@ -40,9 +40,11 @@ ROLLOUT_EXTERNAL_ENGINE_ADDRS="${ROLLOUT_EXTERNAL_ENGINE_ADDRS:-}"
 # WORK_DIR="${WORK_DIR:-${SLIME_DIR}/.tmp/yulan_cross_tokenizer_opd_train}"
 REF_LOAD="${REF_LOAD:-${WORK_DIR}/yulan_torch_dist}"
 ACTOR_CKPT="${ACTOR_CKPT:-${WORK_DIR}/actor_ckpt}"
+CKPT_STEP="${CKPT_STEP:-}"
 LOG_DIR="${WORK_DIR}/logs"
 RUN_LOG="${LOG_DIR}/run.log"
 TEACHER_LOG="${LOG_DIR}/teacher.log"
+RAY_TMPDIR="${RAY_TMPDIR:-/mnt/hdd/lvzhihao/ray_tmp}"
 WANDB_DIR="${WORK_DIR}/wandb"
 DEBUG_ROLLOUT_DIR="${WORK_DIR}/debug_rollouts"
 EVAL_DIR="${WORK_DIR}/eval"
@@ -85,6 +87,9 @@ WANDB_TEAM="${WANDB_TEAM:-}"
 WANDB_HOST="${WANDB_HOST:-}"
 WANDB_MODE="${WANDB_MODE:-online}"
 WANDB_RUN_ID="${WANDB_RUN_ID:-}"
+WANDB_RESUME_FROM_STEP="${WANDB_RESUME_FROM_STEP:-}"
+WANDB_START_FRESH_ON_RESUME="${WANDB_START_FRESH_ON_RESUME:-1}"
+START_ROLLOUT_ID="${START_ROLLOUT_ID:-}"
 
 source "${VENV_DIR}/bin/activate"
 export PYTHONPATH="${YULAN_DIR}"
@@ -256,7 +261,7 @@ if [[ "${REUSE_EXISTING_SERVERS}" != "1" ]] && (( ROLLOUT_NUM_GPUS < ROLLOUT_NUM
     exit 1
 fi
 
-mkdir -p "${WORK_DIR}" "${ACTOR_CKPT}" "${WANDB_DIR}" "${DEBUG_ROLLOUT_DIR}" "${EVAL_DIR}" "${LOG_DIR}"
+mkdir -p "${WORK_DIR}" "${ACTOR_CKPT}" "${WANDB_DIR}" "${DEBUG_ROLLOUT_DIR}" "${EVAL_DIR}" "${LOG_DIR}" "${RAY_TMPDIR}"
 mkdir -p "${WORK_DIR_LINK_DIR}"
 ln -sfn "${WORK_DIR}" "${WORK_DIR_LINK_PATH}"
 
@@ -479,6 +484,7 @@ echo "  ROLLOUT_NUM_GPUS_EFFECTIVE=${ROLLOUT_NUM_GPUS_EFFECTIVE}"
 echo "  MASTER_PORT=${MASTER_PORT}"
 echo "  WORK_DIR=${WORK_DIR}"
 echo "  WORK_DIR_LINK_PATH=${WORK_DIR_LINK_PATH}"
+echo "  RAY_TMPDIR=${RAY_TMPDIR}"
 echo "  WANDB_MODE=${WANDB_MODE}"
 echo "  REUSE_EXISTING_SERVERS=${REUSE_EXISTING_SERVERS}"
 echo "  SGLANG_ROUTER_IP=${SGLANG_ROUTER_IP}"
@@ -563,6 +569,9 @@ CKPT_ARGS=(
     --save "${ACTOR_CKPT}"
     --save-interval "${SAVE_INTERVAL}"
 )
+if [[ -n "${CKPT_STEP}" ]]; then
+    CKPT_ARGS+=(--ckpt-step "${CKPT_STEP}")
+fi
 
 ROLLOUT_ARGS=(
     --prompt-data "${PROMPT_DATA}"
@@ -582,6 +591,9 @@ ROLLOUT_ARGS=(
     --rollout-top-p "${ROLLOUT_TOP_P}"
     --balance-data
 )
+if [[ -n "${START_ROLLOUT_ID}" ]]; then
+    ROLLOUT_ARGS+=(--start-rollout-id "${START_ROLLOUT_ID}")
+fi
 
 RM_ARGS=(
     --custom-rm-path slime.rollout.on_policy_distillation.reward_func
@@ -693,14 +705,23 @@ if [[ -n "${WANDB_API_KEY}" ]]; then
     if [[ -n "${WANDB_HOST}" ]]; then
         WANDB_ARGS+=(--wandb-host "${WANDB_HOST}")
     fi
-    if [[ -n "${WANDB_RUN_ID}" ]]; then
+    if [[ "${WANDB_START_FRESH_ON_RESUME}" == "1" && -n "${WANDB_RESUME_FROM_STEP}" ]]; then
+        WANDB_ARGS+=(--wandb-start-fresh)
+        if [[ -n "${WANDB_RUN_ID}" ]]; then
+            WANDB_ARGS+=(--wandb-run-id "${WANDB_RUN_ID}")
+        fi
+    elif [[ -n "${WANDB_RUN_ID}" ]]; then
         WANDB_ARGS+=(--wandb-run-id "${WANDB_RUN_ID}")
+    fi
+    if [[ -n "${WANDB_RESUME_FROM_STEP}" ]]; then
+        WANDB_ARGS+=(--wandb-resume-from-step "${WANDB_RESUME_FROM_STEP}")
     fi
 fi
 
 export MASTER_ADDR
 export NUM_GPUS
 export RAY_NUM_GPUS
+export RAY_TMPDIR
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_NVLS_ENABLE="${HAS_NVLINK}"
 export CUDA_VISIBLE_DEVICES="${RAY_CUDA_VISIBLE_DEVICES}"
