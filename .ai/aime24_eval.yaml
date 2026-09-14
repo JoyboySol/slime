@@ -1,0 +1,13 @@
+eval:
+  defaults:
+    n_samples_per_eval_prompt: 2
+    temperature: 0.7
+    top_p: 1.0
+    max_response_len: 31744
+    input_key: prompt
+    label_key: label
+    rm_type: dapo
+    apply_chat_template: true
+  datasets:
+    - name: aime24
+      path: /mnt/yulan/lvzhihao/PostTrain/data/aime-2024.jsonl

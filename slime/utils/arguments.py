@@ -98,6 +98,24 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "This will always be true when --colocate is set."
                 ),
             )
+            parser.add_argument(
+                "--destroy-rollout-engines",
+                action="store_true",
+                default=False,
+                help=(
+                    "Destroy SGLang engines after each rollout and recreate them after actor training. "
+                    "This is useful for colocated runs where memory release is not sufficient."
+                ),
+            )
+            parser.add_argument(
+                "--rebuild-train-actors",
+                action="store_true",
+                default=False,
+                help=(
+                    "With --destroy-rollout-engines, release training actors after saving and rebuild them "
+                    "from the latest MCore checkpoint before the next train phase."
+                ),
+            )
 
             reset_arg(parser, "--distributed-backend", type=str, default="nccl")
             reset_arg(parser, "--distributed-timeout-minutes", type=int, default=10)
@@ -669,6 +687,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--apply-chat-template", action="store_true", default=False)
             # Temporarily be JSON-serialized str, will be a real dict after using Omegaconf
             parser.add_argument("--apply-chat-template-kwargs", type=json.loads, default="{}")
+            parser.add_argument(
+                "--system-prompt",
+                type=str,
+                default=None,
+                help="Optional system message prepended to conversational rollout and eval prompts.",
+            )
+            parser.add_argument(
+                "--prompt-suffix",
+                type=str,
+                default=None,
+                help="Text appended to the final user message before applying the chat template.",
+            )
             parser.add_argument("--input-key", type=str, default="input", help="JSON dataset key")
             parser.add_argument("--label-key", type=str, default=None, help="JSON dataset key")
             parser.add_argument(
@@ -886,6 +916,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "The model will be saved to `save_hf.format(rollout_id)`. "
                     "Weights are saved with the same quantization config as `--hf-checkpoint`. "
                 ),
+            )
+            parser.add_argument(
+                "--checkpoint-retention-count",
+                type=int,
+                default=2,
+                help="Keep this many newest MCore/HF snapshots in addition to periodic snapshots.",
+            )
+            parser.add_argument(
+                "--checkpoint-retention-interval",
+                type=int,
+                default=20,
+                help="Keep every Nth one-based training-step snapshot in addition to the newest snapshots.",
             )
             reset_arg(parser, "--seed", type=int, default=1234)
             reset_arg(parser, "--clip-grad", type=float, default=1.0)
@@ -1266,6 +1308,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Save the rollout data to this path for debugging. "
                     "The file will be saved to `save_debug_rollout_data.format(rollout_id)`."
                 ),
+            )
+            parser.add_argument(
+                "--save-debug-rollout-interval",
+                type=int,
+                default=1,
+                help="Save training debug rollouts every N rollout steps; eval rollouts are always saved.",
             )
             # --load-debug-rollout-data, --debug-rollout-only, --debug-train-only
             # are parsed early in _pre_parse_mode() and merged later.
@@ -1849,6 +1897,11 @@ def slime_validate_args(args):
     if args.save_interval is not None:
         assert args.save is not None, "'--save' is required when save_interval is set."
 
+    if args.checkpoint_retention_count < 1:
+        raise ValueError("--checkpoint-retention-count must be >= 1")
+    if args.checkpoint_retention_interval < 1:
+        raise ValueError("--checkpoint-retention-interval must be >= 1")
+
     assert not (args.kl_coef != 0 and args.kl_loss_coef != 0), "Only one of kl_coef and kl_loss_coef can be set"
 
     if args.advantage_estimator in ["reinforce_plus_plus", "reinforce_plus_plus_baseline"]:
@@ -1896,6 +1949,9 @@ def slime_validate_args(args):
     if args.dump_details is not None:
         args.save_debug_rollout_data = f"{args.dump_details}/rollout_data/{{rollout_id}}.pt"
         args.save_debug_train_data = f"{args.dump_details}/train_data/{{rollout_id}}.pt"
+
+    if args.save_debug_rollout_interval < 1:
+        raise ValueError("--save-debug-rollout-interval must be >= 1")
 
     if args.save_debug_train_data is not None and args.save_debug_train_data == args.save_debug_rollout_data:
         raise ValueError("--save-debug-train-data must not be equal to --save-debug-rollout-data.")

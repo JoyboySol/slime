@@ -200,6 +200,22 @@ class ServerGroup:
             return []
         return [engine.resume_memory_occupation.remote(tags=tags) for engine in self.engines if engine is not None]
 
+    def destroy(self):
+        """Shutdown engine processes and release their Ray actors completely."""
+        engines = [engine for engine in self.all_engines if engine is not None]
+        if not engines:
+            return
+        self.num_new_engines = 0
+        shutdown_refs = [engine.shutdown.remote() for engine in engines]
+        for ref in shutdown_refs:
+            try:
+                ray.get(ref)
+            except Exception as exc:
+                logger.warning("SGLang engine shutdown failed; killing Ray actor anyway: %s", exc)
+        for engine in engines:
+            ray.kill(engine, no_restart=True)
+        self.all_engines = [None] * len(self.all_engines)
+
 
 @dataclasses.dataclass
 class RolloutServer:
@@ -328,6 +344,30 @@ class RolloutServer:
         for g in self.server_groups:
             handles.extend(g.onload(tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH]))
         return ray.get(handles) if handles else []
+
+    def destroy_engines(self):
+        """Destroy all SGLang workers while keeping the router and placements."""
+        for group in self.server_groups:
+            group.destroy()
+
+    def recreate_engines(self, model_path: str | None = None):
+        """Recreate workers in the existing placement and wait until healthy."""
+        if model_path is not None:
+            # RolloutServer owns groups; each group carries the overrides used
+            # when its workers are constructed.  Keep the new actor snapshot
+            # in every non-placeholder group for the next engine generation.
+            for group in self.server_groups:
+                if group.worker_type != "placeholder":
+                    group.sglang_overrides["model_path"] = model_path
+                    group.model_path = model_path
+        init_handles: list[Any] = []
+        port_cursors: dict[int, int] = {}
+        for group in self.server_groups:
+            handles, port_cursors = group.start_engines(port_cursors)
+            init_handles.extend(handles)
+        if init_handles:
+            ray.get(init_handles)
+        self.num_new_engines = sum(group.num_new_engines for group in self.server_groups)
 
 
 @dataclasses.dataclass

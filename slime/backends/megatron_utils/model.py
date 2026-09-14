@@ -23,6 +23,7 @@ from megatron.core.utils import get_model_config
 from megatron.training.global_vars import get_args
 from megatron.training.training import get_model
 from tqdm import tqdm
+from torch_memory_saver import torch_memory_saver
 
 try:
     from megatron.core.pipeline_parallel.utils import unwrap_model
@@ -678,7 +679,15 @@ def train_one_step(
 
     if valid_step:
         # Update parameters.
-        update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+        # TE FusedAdam may materialize temporary CUDA tensors (for example
+        # during dtype conversion) while updating parameters.  When the
+        # colocated actor is resumed through torch-memory-saver, tracking
+        # those short-lived buffers can fail in cuMemCreate even though the
+        # normal CUDA allocator still has enough free memory.  Keep the
+        # persistent model/gradient allocations tracked, but let this
+        # transient optimizer workspace use the regular CUDA allocator.
+        with torch_memory_saver.disable() if args.offload_train else nullcontext():
+            update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
         # Update learning rate. Use the per-step global_batch_size when dynamic
         # batching is on so the scheduler's samples-seen counter tracks reality.
@@ -889,8 +898,10 @@ def train(
                     log_dict[f"train/{role_tag}mtp_{_i + 1}_loss"] = mtp_losses[_i].item()
                 log_dict[f"train/{role_tag}mtp_loss"] = mtp_losses.sum().item()
 
-            for param_group_id, param_group in enumerate(optimizer.param_groups):
-                log_dict[f"train/{role_tag}lr-pg_{param_group_id}"] = opt_param_scheduler.get_lr(param_group)
+            # MoE models can have many parameter groups.  Per-group LR metrics
+            # are noisy and mostly redundant in W&B; keep one representative.
+            if optimizer.param_groups:
+                log_dict[f"train/{role_tag}lr"] = opt_param_scheduler.get_lr(optimizer.param_groups[0])
 
             # Per-step gbs — uneven step sizes are easy to miss without this.
             log_dict[f"train/{role_tag}global_batch_size"] = global_batch_sizes[step_id]

@@ -203,6 +203,23 @@ def test_verify_default_dispatches_to_minerva():
 
 
 @pytest.mark.unit
+def test_verify_accepts_bare_latex_matrix_label():
+    """AIME-like labels may contain a bare LaTeX matrix without ``$...$``."""
+    prediction = r"\boxed{\begin{pmatrix} -\dfrac{40}{29} \\ \dfrac{16}{29} \end{pmatrix}}"
+    label = r"\begin{pmatrix} -40/29 \\ 16/29 \end{pmatrix}"
+    correct, _ = verify(prediction, label)
+    assert correct is True
+
+
+@pytest.mark.unit
+def test_verify_accepts_bare_latex_fraction_label():
+    prediction = r"\boxed{-\dfrac{1}{4}}"
+    label = r"-\frac{1}{4}"
+    correct, _ = verify(prediction, label)
+    assert correct is True
+
+
+@pytest.mark.unit
 def test_compute_score_correct_returns_dict_with_reward_one():
     """Public API contract: dict shape with {score, acc, pred} keys."""
     out = compute_score(r"\boxed{42}", "42", strict_box_verify=True)

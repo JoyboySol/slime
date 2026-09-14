@@ -80,6 +80,8 @@ class RolloutDataSource(DataSource):
                 tool_key=args.tool_key,
                 apply_chat_template=args.apply_chat_template,
                 apply_chat_template_kwargs=args.apply_chat_template_kwargs,
+                system_prompt=args.system_prompt,
+                prompt_suffix=args.prompt_suffix,
                 seed=args.rollout_seed,
             )
             if self.args.rollout_shuffle:

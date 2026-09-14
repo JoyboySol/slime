@@ -168,12 +168,13 @@ class RolloutManager:
         if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
             self._try_ci_fault_injection()
         data, metrics = self._get_rollout_data(rollout_id=rollout_id)
-        save_debug_rollout_data(
-            self.args.save_debug_rollout_data,
-            data,
-            rollout_id=rollout_id,
-            evaluation=False,
-        )
+        if rollout_id % self.args.save_debug_rollout_interval == 0:
+            save_debug_rollout_data(
+                self.args.save_debug_rollout_data,
+                data,
+                rollout_id=rollout_id,
+                evaluation=False,
+            )
         log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
         if self.args.debug_rollout_only:
             # if debug rollout only, we don't convert samples to train data and directly return
@@ -208,6 +209,20 @@ class RolloutManager:
         self.health_monitoring_pause()
         for srv in self.servers.values():
             srv.offload()
+
+    def destroy_engines(self):
+        """Fully stop local SGLang workers but keep the rollout manager/router alive."""
+        self.health_monitoring_pause()
+        for srv in self.servers.values():
+            srv.destroy_engines()
+        logger.info("Destroyed all local SGLang rollout engines after rollout data was materialized.")
+
+    def recreate_engines(self, model_path: str | None = None):
+        """Start SGLang workers again in the original placement."""
+        for srv in self.servers.values():
+            srv.recreate_engines(model_path=model_path)
+        self.health_monitoring_resume()
+        logger.info("Recreated all local SGLang rollout engines; ready for actor weight update.")
 
     def onload(self, tags: list[str] | None = None):
         for srv in self.servers.values():

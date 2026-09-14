@@ -179,7 +179,14 @@ def create_actor_model(args, pgs, rollout_manager, actor_cls=None):
         with_opd_teacher=actor_args.use_opd and actor_args.opd_type == "megatron",
         **actor_model_kwargs,
     )
-    actor_start_rollout_ids = actor_model.create(rollout_manager=rollout_manager)
+    # In the strict rollout/train lifecycle, SGLang must be initialized while
+    # the training actor is absent from GPU memory.  Allocate the Ray group
+    # now, but defer actor.init() until train.py has destroyed the rollout
+    # engines after the first rollout.
+    if args.rebuild_train_actors:
+        actor_start_rollout_ids = [args.start_rollout_id or 0]
+    else:
+        actor_start_rollout_ids = actor_model.create(rollout_manager=rollout_manager)
     return actor_model, actor_start_rollout_ids
 
 

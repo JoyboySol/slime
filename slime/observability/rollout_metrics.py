@@ -220,6 +220,25 @@ def _compute_reward_cat_metrics(args, all_samples: list[Sample]):
     return {f"error_cat/{reward_cat}": len(s) / len(all_samples) for reward_cat, s in samples_of_reward_cat.items()}
 
 
+def _get_eval_reward_value(reward: Any, reward_key: str | None):
+    """Return a scalar reward for eval metrics.
+
+    Rule-based reward models such as DAPO return a dictionary containing the
+    trainable score and auxiliary fields.  Eval metrics operate on scalar
+    rewards, so use the configured key and provide the conventional DAPO
+    ``score`` fallback when no key was configured.
+    """
+    if isinstance(reward, dict):
+        key = reward_key or "score"
+        if key not in reward:
+            raise KeyError(f"Eval reward dict has no key {key!r}; available keys: {sorted(reward)}")
+        reward = reward[key]
+    if isinstance(reward, bool) or not isinstance(reward, (int, float, np.number)):
+        raise TypeError(f"Eval reward must be scalar, got {type(reward).__name__}: {reward!r}")
+    # DAPO uses -1/1 for training, while eval reports accuracy as 0/1.
+    return float(reward > 0)
+
+
 def log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any] | None = None):
     if args.custom_eval_rollout_log_function_path is not None:
         custom_log_func = load_function(args.custom_eval_rollout_log_function_path)
@@ -228,7 +247,10 @@ def log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any] 
 
     log_dict = extra_metrics or {}
     for key in data.keys():
-        rewards = data[key]["rewards"]
+        rewards = [
+            _get_eval_reward_value(reward, getattr(args, "eval_reward_key", None) or args.reward_key)
+            for reward in data[key]["rewards"]
+        ]
         log_dict[f"eval/{key}"] = sum(rewards) / len(rewards)
         if (samples := data[key].get("samples")) is not None:
             log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), f"eval/{key}/")

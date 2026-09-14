@@ -14,6 +14,13 @@
 # Adapted from https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/hendrycks_math/utils.py
 
 import re
+
+try:
+    from math_verify import parse as math_verify_parse
+    from math_verify import verify as math_verify_verify
+except ImportError:  # pragma: no cover - optional dependency in minimal installs
+    math_verify_parse = None
+    math_verify_verify = None
 import signal
 
 
@@ -196,18 +203,37 @@ def is_correct_minerva(
     Returns:
         Tuple of (is_correct, normalized_prediction)
     """
-    # Extract answer from solution
-    match = re.findall(answer_pattern, solution_str)
-    extracted_answer = match[-1] if match else "[INVALID]"
+    # Prefer the final boxed expression when available.  This also works for
+    # long chain-of-thought responses where the answer is not written as
+    # ``Answer: ...``.
+    boxed = last_boxed_only_string(solution_str)
+    if boxed is not None:
+        extracted_answer = remove_boxed(boxed)
+    else:
+        match = re.findall(answer_pattern, solution_str)
+        extracted_answer = match[-1] if match else "[INVALID]"
     pred = normalize_final_answer(extracted_answer)
 
     # Process ground truth
-    if gt_need_extract:
-        gt = normalize_final_answer(remove_boxed(last_boxed_only_string(gt)))
+    if gt_need_extract and (boxed_gt := last_boxed_only_string(gt)) is not None:
+        gt = normalize_final_answer(remove_boxed(boxed_gt))
     else:
         gt = normalize_final_answer(gt)
 
-    gt = str(int(float(gt)))  # in dapo, all answers are integers
+    # DAPO originally assumed integer-only answers.  The training corpus also
+    # contains letter and symbolic answers, so compare numeric values when
+    # both sides are numeric and otherwise compare normalized strings.
+    numeric_pattern = r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$"
+    if re.fullmatch(numeric_pattern, pred.replace(",", "")) and re.fullmatch(numeric_pattern, gt.replace(",", "")):
+        pred_value = float(pred.replace(",", ""))
+        gt_value = float(gt.replace(",", ""))
+        # Keep integer answers readable while still treating ``42`` and
+        # ``42.0`` as the same numeric value.
+        pred = str(int(pred_value)) if pred_value.is_integer() else str(pred_value)
+        gt = str(int(gt_value)) if gt_value.is_integer() else str(gt_value)
+    else:
+        pred = pred.strip().casefold()
+        gt = gt.strip().casefold()
 
     return (pred == gt), pred
 
@@ -237,6 +263,28 @@ def is_correct_strict_box(pred: str, gt: str, pause_tokens_index: list[int] | No
     return 1 if (extracted_pred == gt) else -1, extracted_pred
 
 
+def _math_verify_variants(text: str) -> list[str]:
+    """Return parseable variants for a math expression.
+
+    ``math_verify`` treats a bare LaTeX fragment such as ``\\begin{pmatrix}...
+    \\end{pmatrix}`` as prose and may extract only its last scalar.  Dataset
+    labels frequently contain exactly these bare fragments, while model
+    answers usually put them inside ``$...$`` or ``\\boxed{...}``.  Add math
+    delimiters only for delimiter-free, math-looking text and keep the raw
+    form first for prose answers.
+    """
+    text = str(text).strip()
+    variants = [text]
+    has_delimiter = any(token in text for token in ("$", r"\(", r"\[", r"\boxed{"))
+    looks_like_math = bool(
+        re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", text)
+        or re.search(r"\\(?:begin|end|frac|dfrac|tfrac|sqrt|left|right|text|mathrm)\b", text)
+    )
+    if text and not has_delimiter and looks_like_math:
+        variants.extend([f"${text}$", rf"\boxed{{{text}}}"])
+    return variants
+
+
 def verify(
     solution_str: str, answer: str, strict_box_verify: bool = False, pause_tokens_index: list[int] | None = None
 ) -> bool:
@@ -254,6 +302,37 @@ def verify(
     if strict_box_verify:
         correct, pred = is_correct_strict_box(solution_str, answer, pause_tokens_index)
         return correct == 1, pred
+
+    # Prefer math-verify when available.  Unlike the original DAPO checker,
+    # this handles mathematically equivalent fractions, decimals, radicals,
+    # equations, sets, and other non-integer answers.  Prefer the last boxed
+    # answer when present: parsing an entire long chain of thought can select
+    # an intermediate number or fail on an incomplete expression near the
+    # truncation boundary.
+    if math_verify_parse is not None and math_verify_verify is not None:
+        candidates = []
+        boxed = last_boxed_only_string(solution_str)
+        if boxed is not None:
+            candidates.append(remove_boxed(boxed))
+        candidates.append(solution_str[-2000:])
+        try:
+            for expected_text in _math_verify_variants(answer):
+                try:
+                    expected = math_verify_parse(expected_text, extraction_mode="any_match")
+                except Exception:
+                    continue
+                if not expected:
+                    continue
+                for candidate in candidates:
+                    for candidate_text in _math_verify_variants(candidate):
+                        try:
+                            predicted = math_verify_parse(candidate_text, extraction_mode="any_match")
+                            if predicted and math_verify_verify(expected, predicted, strict=True):
+                                return True, predicted[-1]
+                        except Exception:
+                            continue
+        except Exception:
+            pass
 
     correct, pred = is_correct_minerva(solution_str, answer)
     return correct, pred
@@ -276,9 +355,6 @@ def compute_score(
     Returns:
         Reward score (1.0 for correct, -1.0 for incorrect)
     """
-    # Limit solution length for efficiency
-    solution_str = solution_str[-300:]  # The longest answer in MATH-500 has 159 characters
-
     # Verify the solution
     correct, pred = verify(solution_str, ground_truth, strict_box_verify, pause_tokens_index)
 

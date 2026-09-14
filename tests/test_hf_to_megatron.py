@@ -164,6 +164,57 @@ def test_hf_and_megatron_mappings_round_trip(loader, exporter, model_type, name,
 
 
 @pytest.mark.unit
+def test_qwen3_next_exports_yulan_native_gdn_layout():
+    args = types.SimpleNamespace(
+        kv_channels=2,
+        hidden_size=3,
+        num_attention_heads=2,
+        num_query_groups=1,
+        linear_num_key_heads=2,
+        linear_num_value_heads=4,
+        linear_key_head_dim=2,
+        linear_value_head_dim=2,
+    )
+    hidden_size = 3
+    key_dim = 4
+    value_dim = 8
+    fused = torch.arange((2 * value_dim + 2 * key_dim + 8) * hidden_size).reshape(-1, hidden_size)
+
+    converted = dict(
+        convert_qwen3_next_to_hf(
+            args,
+            "module.module.decoder.layers.5.self_attention.in_proj.weight",
+            fused,
+        )
+    )
+
+    query, key, value, z, beta, alpha = torch.split(fused, [4, 4, 8, 8, 4, 4])
+    expected_qkvz = torch.cat(
+        [
+            query.reshape(2, 2, 3),
+            key.reshape(2, 2, 3),
+            value.reshape(2, 4, 3),
+            z.reshape(2, 4, 3),
+        ],
+        dim=1,
+    ).flatten(0, 1)
+    expected_ba = torch.cat([beta.reshape(2, 2, 3), alpha.reshape(2, 2, 3)], dim=1).flatten(0, 1)
+
+    assert torch.equal(converted["model.layers.5.linear_attn.in_proj_qkvz.weight"], expected_qkvz)
+    assert torch.equal(converted["model.layers.5.linear_attn.in_proj_ba.weight"], expected_ba)
+
+    conv = torch.arange((value_dim + 2 * key_dim) * 4).reshape(-1, 1, 4)
+    conv_name, converted_conv = convert_qwen3_next_to_hf(
+        args,
+        "module.module.decoder.layers.5.self_attention.conv1d.weight",
+        conv,
+    )[0]
+    query_conv, key_conv, value_conv = torch.split(conv, [key_dim, key_dim, value_dim])
+    assert conv_name == "model.layers.5.linear_attn.conv1d.weight"
+    assert torch.equal(converted_conv, torch.cat([query_conv, key_conv, value_conv]))
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("model_name", ["deepseekv32config", "kimik2config"])
 def test_deepseek_family_parameter_updates_use_the_direct_exporter(model_name):
     parameter = torch.randn(8, 8)
@@ -220,6 +271,31 @@ def test_qwen_and_llama_share_the_basic_qkv_mapping():
 
     assert torch.equal(loaded, torch.cat((q, k, v)))
     assert _LOADERS["qwen3"] is _LOADERS["llama"] is qwen_hf_tensor
+
+
+@pytest.mark.unit
+def test_qwen3_next_exports_standard_gqa_qkv_layout():
+    q = torch.arange(64).view(8, 8)
+    k = torch.arange(32).view(4, 8) + 100
+    v = torch.arange(32).view(4, 8) + 200
+
+    converted = convert_qwen3_next_to_hf(
+        _EXPORT_ARGS,
+        "module.module.decoder.layers.0.self_attention.linear_qkv.weight",
+        torch.cat(
+            [
+                q.view(2, 2, 2, 8),
+                k.view(2, 1, 2, 8),
+                v.view(2, 1, 2, 8),
+            ],
+            dim=1,
+        ).reshape(-1, 8),
+    )
+
+    converted = dict(converted)
+    assert torch.equal(converted["model.layers.0.self_attn.q_proj.weight"], q)
+    assert torch.equal(converted["model.layers.0.self_attn.k_proj.weight"], k)
+    assert torch.equal(converted["model.layers.0.self_attn.v_proj.weight"], v)
 
 
 @pytest.mark.unit

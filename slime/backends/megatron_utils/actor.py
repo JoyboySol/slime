@@ -68,6 +68,10 @@ class MegatronTrainRayActor(TrainRayActor):
 
         monkey_patch_torch_dist()
         super().init(args, role, with_ref, with_opd_teacher)
+        if args.use_routing_replay and role == "actor":
+            # Keep the replay feature enabled in the Megatron worker process.
+            # Ray runtime_env does not reliably preserve this actor-local flag.
+            os.environ["ENABLE_ROUTING_REPLAY"] = "1"
         # Destroying and recreating WORLD invalidates raw dist.group.WORLD references cached by external code.
         # Set SLIME_DESTROY_WORLD_PROCESS_GROUP=0 when such references may outlive a train sleep/wake cycle.
         if os.getenv("SLIME_DESTROY_WORLD_PROCESS_GROUP", "1").lower() not in {"0", "false", "no"}:
@@ -514,8 +518,11 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.use_routing_replay:
             RoutingReplay.clear_all()
 
-        # update the cpu actor weight to the latest model
-        self.weights_backuper.backup("actor")
+        # The post-step GPU->CPU snapshot can allocate transient CUDA staging
+        # buffers.  Keep those allocations out of the active TMS pool so a
+        # colocated train/rollout worker does not fail before its offload.
+        with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
+            self.weights_backuper.backup("actor")
 
         # Update ref model if needed
         if (

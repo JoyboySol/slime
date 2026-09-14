@@ -1,0 +1,56 @@
+diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
+index 6f9999f08..8eef95788 100644
+--- a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
++++ b/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
+@@ -54,8 +54,13 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
+         overlap_cpu_optimizer_d2h_h2d: bool = True,
+         **kwargs
+     ):
++        # Initialize the torch optimizer with a harmless leaf parameter. The
++        # distributed optimizer passes non-leaf shard views, which cannot be
++        # handed to torch.optim directly; real sub-optimizer parameters are
++        # constructed below.
++        _dummy_param = torch.nn.Parameter(torch.empty(0), requires_grad=False)
+         super(HybridDeviceOptimizer, self).__init__(
+-            params,
++            [_dummy_param],
+             defaults={
+                 "offload_fraction": offload_fraction,
+                 "cpu_optimizer_cls": cpu_optimizer_cls,
+@@ -67,6 +72,27 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
+                 **kwargs,
+             },
+         )
++        self.param_groups.clear()
++        self.state.clear()
++        # DistributedOptimizer passes shard views here. They are valid bookkeeping
++        # parameters but are non-leaf tensors, so torch.optim.Optimizer rejects them.
++        # The actual CPU/GPU sub-optimizers receive detached leaf copies below.
++        if isinstance(params, torch.Tensor):
++            params = [params]
++        for param_group in params:
++            if isinstance(param_group, dict):
++                param_group = param_group.copy()
++                group_params = param_group["params"]
++                if isinstance(group_params, torch.Tensor):
++                    group_params = [group_params]
++                else:
++                    group_params = list(group_params)
++                param_group["params"] = group_params
++            else:
++                param_group = {"params": [param_group]}
++            for name, default in self.defaults.items():
++                param_group.setdefault(name, default)
++            self.param_groups.append(param_group)
+ 
+         self.offload_fraction = offload_fraction
+         self.cpu_optimizer_cls = cpu_optimizer_cls
+@@ -275,7 +301,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
+                     offload_params_numel += param.numel()
+                     cpu_copy = True
+                 if self.param_update_in_fp32 and param.dtype != torch.float32:
+-                    param = param.detach().clone().float()
++                    param = param.detach().clone().float().detach()
+                     param_to_fp32_param[orig_param] = param
+ 
+                 if cpu_copy:

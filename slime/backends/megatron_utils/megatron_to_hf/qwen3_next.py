@@ -3,6 +3,67 @@ import re
 import torch
 
 
+def _convert_yulan_gdn_to_hf(args, layer_idx, rest, param):
+    """Convert YuLan's native MCore GDN tensors to Qwen3-Next HF tensors."""
+
+    prefix = f"model.layers.{layer_idx}"
+    direct_mapping = {
+        "self_attention.in_proj.layer_norm_weight": "input_layernorm.weight",
+        "self_attention.A_log": "linear_attn.A_log",
+        "self_attention.dt_bias": "linear_attn.dt_bias",
+        "self_attention.out_norm.weight": "linear_attn.norm.weight",
+        "self_attention.out_proj.weight": "linear_attn.out_proj.weight",
+    }
+    if rest in direct_mapping:
+        return [(f"{prefix}.{direct_mapping[rest]}", param)]
+
+    if rest in {"self_attention.in_proj.weight", "self_attention.conv1d.weight"}:
+        num_key_heads = args.linear_num_key_heads
+        num_value_heads = args.linear_num_value_heads
+        key_head_dim = args.linear_key_head_dim
+        value_head_dim = args.linear_value_head_dim
+        key_dim = num_key_heads * key_head_dim
+        value_dim = num_value_heads * value_head_dim
+
+    if rest == "self_attention.in_proj.weight":
+        # YuLan's MCore GDN layout is [query, key, value, z, beta, alpha].
+        # Keep this in lockstep with YuLan-Pretrain's mcore_gdn_moe
+        # synchronizer; using the HF order here silently produces valid-shaped
+        # but semantically scrambled weights.
+        query, key, value, z, beta, alpha = torch.split(
+            param,
+            [key_dim, key_dim, value_dim, value_dim, num_value_heads, num_value_heads],
+            dim=0,
+        )
+        values_per_key = num_value_heads // num_key_heads
+        qkvz = torch.cat(
+            [
+                query.reshape(num_key_heads, key_head_dim, -1),
+                key.reshape(num_key_heads, key_head_dim, -1),
+                value.reshape(num_key_heads, values_per_key * value_head_dim, -1),
+                z.reshape(num_key_heads, values_per_key * value_head_dim, -1),
+            ],
+            dim=1,
+        ).flatten(0, 1)
+        ba = torch.cat(
+            [
+                beta.reshape(num_key_heads, values_per_key, -1),
+                alpha.reshape(num_key_heads, values_per_key, -1),
+            ],
+            dim=1,
+        ).flatten(0, 1)
+        return [
+            (f"{prefix}.linear_attn.in_proj_qkvz.weight", qkvz),
+            (f"{prefix}.linear_attn.in_proj_ba.weight", ba),
+        ]
+
+    if rest == "self_attention.conv1d.weight":
+        query, key, value = torch.split(param, [key_dim, key_dim, value_dim], dim=0)
+        return [(f"{prefix}.linear_attn.conv1d.weight", torch.cat([query, key, value], dim=0))]
+
+    return None
+
+
 def _convert_mtp_layer(args, name, param, layer_idx):
     """Convert MTP layer parameters from Megatron to HuggingFace format.
 
@@ -74,6 +135,9 @@ def convert_qwen3_next_to_hf(args, name, param):
     if match:
         layer_idx, rest = match.groups()
 
+        if (converted := _convert_yulan_gdn_to_hf(args, layer_idx, rest, param)) is not None:
+            return converted
+
         # experts
         expert_pattern = r"mlp.experts\.(.+)\.weight(\d+)"
         match = re.match(expert_pattern, rest)
@@ -116,14 +180,30 @@ def convert_qwen3_next_to_hf(args, name, param):
             return [(f"model.layers.{layer_idx}.self_attn.o_proj.weight", param)]
         elif rest == "self_attention.linear_qkv.weight":
             param = param.view(args.num_query_groups, -1, head_dim, args.hidden_size)
-            q_param, k_param, v_param = torch.split(
-                param, split_size_or_sections=[2 * value_num_per_group, 1, 1], dim=1
-            )
-            q_param = (
-                q_param.reshape(args.num_query_groups, 2, value_num_per_group, head_dim, args.hidden_size)
-                .transpose(1, 2)
-                .reshape(-1, args.hidden_size)
-            )
+            # Qwen3.5's gated attention stores two query projections per
+            # group.  YuLan Qwen3-Next's full-attention layers use ordinary
+            # GQA instead (one query projection per group).  The MCore
+            # checkpoint determines the layout unambiguously from this fused
+            # projection's per-group width.
+            if param.shape[1] == value_num_per_group + 2:
+                q_param, k_param, v_param = torch.split(
+                    param, split_size_or_sections=[value_num_per_group, 1, 1], dim=1
+                )
+                q_param = q_param.reshape(-1, args.hidden_size)
+            elif param.shape[1] == 2 * value_num_per_group + 2:
+                q_param, k_param, v_param = torch.split(
+                    param, split_size_or_sections=[2 * value_num_per_group, 1, 1], dim=1
+                )
+                q_param = (
+                    q_param.reshape(args.num_query_groups, 2, value_num_per_group, head_dim, args.hidden_size)
+                    .transpose(1, 2)
+                    .reshape(-1, args.hidden_size)
+                )
+            else:
+                raise ValueError(
+                    f"Unexpected QKV layout for {name}: per-group width {param.shape[1]}, "
+                    f"expected {value_num_per_group + 2} or {2 * value_num_per_group + 2}"
+                )
             k_param = k_param.reshape(-1, args.hidden_size)
             v_param = v_param.reshape(-1, args.hidden_size)
             return [

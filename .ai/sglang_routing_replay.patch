@@ -1,0 +1,67 @@
+diff --git a/sglang/srt/layers/moe/topk.py b/sglang/srt/layers/moe/topk.py
+--- a/sglang/srt/layers/moe/topk.py
++++ b/sglang/srt/layers/moe/topk.py
+@@ -49,6 +49,7 @@
+ from sglang.srt.layers.moe import get_moe_runner_backend
+ from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
+ from sglang.srt.layers.utils import MultiPlatformOp
++from sglang.srt.server_args import get_global_server_args
+ from sglang.srt.utils import (
+     cpu_has_amx_support,
+     get_bool_env_var,
+@@ -290,6 +291,24 @@
+             output_format = TopKOutputFormat.STANDARD
+ 
+         if output_format == TopKOutputFormat.TRITON_KERNEL:
++            # Custom routing functions (for example YuLan-MoE's sqrt-gate)
++            # must go through select_experts so routing-replay capture runs.
++            # The raw Triton routing path does not expose top-k ids to the
++            # routed-experts capturer.
++            if get_global_server_args().enable_return_routed_experts:
++                self.topk_config.torch_native = False
++                with use_symmetric_memory(
++                    get_tp_group(), disabled=not is_allocation_symmetric()
++                ):
++                    return select_experts(
++                        hidden_states=hidden_states,
++                        layer_id=self.layer_id,
++                        router_logits=router_logits,
++                        topk_config=self.topk_config,
++                        num_token_non_padded=num_token_non_padded,
++                        expert_location_dispatch_info=expert_location_dispatch_info,
++                    )
++
+             # renormalize=True is equivalent to sm_first=False
+             routing_data, gather_idx, scatter_idx = routing(
+                 router_logits,
+diff --git a/sglang/srt/managers/tokenizer_manager.py b/sglang/srt/managers/tokenizer_manager.py
+--- a/sglang/srt/managers/tokenizer_manager.py
++++ b/sglang/srt/managers/tokenizer_manager.py
+@@ -961,6 +961,15 @@
+                 http_worker_ipc=obj.http_worker_ipc,
+             )
+ 
++        # The RL routing-replay server flag is authoritative.  Some request
++        # construction paths do not preserve the HTTP field all the way to the
++        # scheduler, which otherwise makes the scheduler collect routes but
++        # omit them from Batch*Output.
++        if getattr(self.server_args, "enable_return_routed_experts", False) and isinstance(
++            tokenized_obj, TokenizedGenerateReqInput
++        ):
++            tokenized_obj.return_routed_experts = True
++
+         return tokenized_obj
+ 
+     async def _batch_tokenize_and_process(
+@@ -1541,8 +1550,9 @@
+ 
+             if getattr(recv_obj, "output_hidden_states", None):
+                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
+-            if getattr(recv_obj, "routed_experts", None):
+-                meta_info["routed_experts"] = recv_obj.routed_experts[i]
++            routed_experts_debug = getattr(recv_obj, "routed_experts", None)
++            if routed_experts_debug:
++                meta_info["routed_experts"] = routed_experts_debug[i]
+             if getattr(recv_obj, "customized_info", None):
+                 for k, v in recv_obj.customized_info.items():
+                     meta_info[k] = v[i]

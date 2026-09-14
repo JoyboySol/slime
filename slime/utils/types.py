@@ -244,7 +244,16 @@ class Sample:
         return sample
 
     def get_reward_value(self, args) -> float:
-        return self.reward if not args.reward_key else self.reward[args.reward_key]
+        if args.reward_key:
+            return self.reward[args.reward_key]
+        if isinstance(self.reward, dict):
+            # DAPO-style reward models return auxiliary fields together with
+            # the scalar training score. Keep the explicit --reward-key
+            # override, but make the conventional score field safe by default.
+            if "score" not in self.reward:
+                raise KeyError(f"Reward dict has no 'score' key: {sorted(self.reward)}")
+            return self.reward["score"]
+        return self.reward
 
     @property
     def effective_response_length(self):

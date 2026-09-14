@@ -557,6 +557,8 @@ async def eval_rollout_single_dataset(
         args.hf_checkpoint,
         eval_apply_chat_template,
         json.dumps(eval_multimodal_keys, sort_keys=True) if eval_multimodal_keys is not None else None,
+        args.system_prompt,
+        args.prompt_suffix,
         (
             json.dumps(eval_apply_chat_template_kwargs, sort_keys=True)
             if eval_apply_chat_template_kwargs is not None
@@ -578,6 +580,8 @@ async def eval_rollout_single_dataset(
             tool_key=dataset_cfg.tool_key,
             apply_chat_template=eval_apply_chat_template,
             apply_chat_template_kwargs=eval_apply_chat_template_kwargs,
+            system_prompt=args.system_prompt,
+            prompt_suffix=args.prompt_suffix,
         )
     dataset = EVAL_PROMPT_DATASET[cache_key]
 

@@ -28,6 +28,18 @@ def read_file(path):
     if not os.path.exists(path):
         raise FileNotFoundError(f"Prompt dataset path '{path}' does not exist.")
 
+    if os.path.isdir(path):
+        jsonl_paths = sorted(
+            os.path.join(path, name)
+            for name in os.listdir(path)
+            if name.endswith(".jsonl")
+        )
+        if not jsonl_paths:
+            raise ValueError(f"Prompt dataset directory '{path}' contains no .jsonl files.")
+        for jsonl_path in jsonl_paths:
+            yield from read_file(jsonl_path)
+        return
+
     if path.endswith(".jsonl"):
 
         def jsonl_reader(p):
@@ -227,12 +239,35 @@ class Dataset:
         seed=42,
         apply_chat_template=False,
         apply_chat_template_kwargs=None,
+        system_prompt=None,
+        prompt_suffix=None,
     ):
         origin_samples = []
         for data in read_file(path):
             # Both chat templates and multimodal inputs require conversation format (list of message dicts)
             as_conversation = apply_chat_template or (multimodal_keys is not None)
             prompt = _build_messages(data, prompt_key, as_conversation, multimodal_keys)
+            if prompt_suffix:
+                if isinstance(prompt, list):
+                    user_indices = [i for i, message in enumerate(prompt) if message.get("role") == "user"]
+                    if not user_indices or not isinstance(prompt[user_indices[-1]].get("content"), str):
+                        raise TypeError("prompt_suffix requires a final user message with string content")
+                    user_index = user_indices[-1]
+                    prompt[user_index] = {
+                        **prompt[user_index],
+                        "content": prompt[user_index]["content"] + prompt_suffix,
+                    }
+                elif isinstance(prompt, str):
+                    prompt += prompt_suffix
+                else:
+                    raise TypeError(f"prompt_suffix is unsupported for prompt type {type(prompt)}")
+            if system_prompt is not None:
+                if not isinstance(prompt, list):
+                    raise TypeError("system_prompt requires a conversational prompt")
+                if prompt and prompt[0].get("role") == "system":
+                    prompt = [{**prompt[0], "content": system_prompt}, *prompt[1:]]
+                else:
+                    prompt = [{"role": "system", "content": system_prompt}, *prompt]
 
             metadata = data.get(metadata_key) or {}
             tools = None
@@ -333,6 +368,9 @@ def get_source(sample: Sample) -> str:
     metadata = getattr(sample, "metadata", None) or {}
     if getattr(sample, "source", None):
         return sample.source
-    if metadata.get("source_name"):
+    # Dataset metadata is intentionally opaque and can be a JSON string (for
+    # example, a serialized chat ``messages`` column).  Only mappings can
+    # carry the optional source_name convention.
+    if isinstance(metadata, dict) and metadata.get("source_name"):
         return metadata["source_name"]
     return "unknown"
