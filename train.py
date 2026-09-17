@@ -19,7 +19,8 @@ def train(args):
     # need to initialize rollout manager first to calculate num_rollout
     rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"])
 
-    if args.rebuild_train_actors:
+    defer_actor_init = args.rebuild_train_actors or args.destroy_rollout_engines
+    if defer_actor_init:
         # actor.init() is intentionally deferred until after the first rollout
         # engines are destroyed.  Normally actor.init() publishes this config,
         # but generate() needs it earlier to split replay data by DP rank.
@@ -35,7 +36,7 @@ def train(args):
 
     actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
 
-    if args.rebuild_train_actors:
+    if defer_actor_init:
         # The first rollout is served directly from the HF checkpoint. Keep
         # the training actor out of GPU memory until rollout data is ready.
         actor_model.release()
@@ -77,7 +78,9 @@ def train(args):
         elif args.offload_rollout:
             ray.get(rollout_manager.offload.remote())
 
-        if release_train or args.rebuild_train_actors:
+        if release_train or args.rebuild_train_actors or (
+            args.destroy_rollout_engines and rollout_id == args.start_rollout_id
+        ):
             actor_model.create()
 
         actor_trains = (not args.use_critic) or rollout_id >= args.num_critic_only_steps

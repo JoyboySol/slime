@@ -39,7 +39,7 @@ CKPT_ARGS=(
    --model-name qwen3_next
    --ref-load "${MCORE_CHECKPOINT}"
    --save "${OUTPUT_ROOT}"
-   --save-interval 1
+   --save-interval "${SAVE_INTERVAL:-1}"
    --checkpoint-retention-count 2
    --checkpoint-retention-interval 20
    --no-save-optim
@@ -106,12 +106,14 @@ PARALLEL_ARGS=(
    --context-parallel-size 8
    --expert-model-parallel-size 8
    --expert-tensor-parallel-size 1
-   --use-dynamic-batch-size
-   --max-tokens-per-gpu 1536
+   --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU:-1536}"
    --recompute-granularity full
    --recompute-method uniform
    --recompute-num-layers 1
 )
+if [[ "${USE_DYNAMIC_BATCH_SIZE:-1}" == "1" ]]; then
+   PARALLEL_ARGS+=(--use-dynamic-batch-size)
+fi
 
 ALGORITHM_ARGS=(
    --advantage-estimator grpo
@@ -147,6 +149,7 @@ SGLANG_ARGS=(
    # two-GPU engines on the eight rollout GPUs instead of running an
    # unvalidated TP8/EP8 engine, which produces corrupted trajectories here.
    --rollout-num-gpus-per-engine 2
+   --sglang-tensor-parallel-size 2
    --sglang-ep-size 2
    --sglang-dtype bfloat16
    # The released HF config omits this YuLan checkpoint semantic.  Keep the
@@ -210,6 +213,10 @@ if [[ "${COLOCATE:-0}" == "1" ]]; then
       # Replay-only validation has no SGLang workers. Avoid initializing the
       # TorchMemorySaver offload path in this mode.
       TRAIN_LAYOUT_ARGS+=(--no-offload-train --no-offload-rollout)
+   elif [[ "${DESTROY_ROLLOUT_ENGINES:-0}" == "1" ]]; then
+      # Engines are destroyed before actor_train and recreated after saving;
+      # no TorchMemorySaver offload is needed in this lifecycle.
+      TRAIN_LAYOUT_ARGS+=(--no-offload-train --no-offload-rollout)
    else
       if [[ "${REBUILD_TRAIN_ACTORS:-0}" == "1" ]]; then
          TRAIN_LAYOUT_ARGS+=(--no-offload-train --no-offload-rollout)
@@ -225,7 +232,7 @@ fi
 # W&B credential through the runtime environment without putting it in the
 # command line or repository files.  Disable xtrace while expanding the secret.
 set +x
-RUNTIME_ENV_JSON="{\"env_vars\":{\"WANDB_API_KEY\":\"${WANDB_API_KEY:-}\"}}"
+RUNTIME_ENV_JSON="{\"env_vars\":{\"WANDB_API_KEY\":\"${WANDB_API_KEY:-}\",\"SLIME_USE_YULAN_THD_CP\":\"${SLIME_USE_YULAN_THD_CP:-0}\",\"SLIME_USE_YULAN_TRANSFORMER_BLOCK\":\"${SLIME_USE_YULAN_TRANSFORMER_BLOCK:-0}\"}}"
 
 # Keep xtrace disabled through submission: Ray's command echo would otherwise
 # print the W&B credential embedded in runtime_env_json.

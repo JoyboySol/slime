@@ -99,6 +99,29 @@ class MegatronTrainRayActor(TrainRayActor):
             args, role
         )
 
+        if args.use_routing_replay and role == "actor":
+            # The YuLan router patch normally registers these during router
+            # construction.  When the model is built through the TransformerBlock
+            # adapter, however, construction can happen before the actor-local
+            # replay environment is visible.  Attach the replay slots explicitly
+            # after the model is fully built, before any rollout is trained.
+            from slime.utils.routing_replay import register_routing_replay
+
+            router_count = 0
+            for model_chunk in self.model:
+                for module in model_chunk.modules():
+                    if module.__class__.__name__ != "TopKRouter":
+                        continue
+                    if not hasattr(module, "routing_replay"):
+                        register_routing_replay(module)
+                    if hasattr(module, "routing_replay"):
+                        router_count += 1
+            logger.info(
+                "Routing replay initialized for %d local TopKRouter modules (%d replay slots)",
+                router_count,
+                len(RoutingReplay.all_routing_replays),
+            )
+
         vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1
         if vpp_size > 1:
             from megatron.core.utils import get_model_config

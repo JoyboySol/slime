@@ -1,3 +1,4 @@
+import os
 from collections.abc import Callable, Sequence
 
 import torch
@@ -266,6 +267,22 @@ def prepare_routed_experts_for_routing_replay(
         assert experts.shape[0] == token_ids.shape[0] - 1, f"{experts.shape}, {token_ids.shape}"
 
     padded_experts = [_pad_routed_experts(experts, 1, num_experts) for experts in rollout_routed_experts]
+
+    if os.environ.get("SLIME_USE_YULAN_THD_CP") == "1" and not allgather_cp:
+        # YuLan's packed THD input pads every sample before applying TE's
+        # interleaved CP partition. Routing replay must use the same physical
+        # layout; the router receives the padding mask separately and keeps
+        # these rows in its static dispatch shape.
+        cp_size = mpu.get_context_parallel_world_size()
+        alignment = 2 * cp_size
+        local_experts = []
+        for experts, token_ids in zip(padded_experts, tokens, strict=True):
+            token_length = token_ids.size(0)
+            padded_length = ((token_length + alignment - 1) // alignment) * alignment
+            experts = _pad_routed_experts(experts, padded_length - token_length, num_experts)
+            local_experts.append(slice_with_cp(experts, 0))
+        return torch.cat(local_experts, dim=0)
+
     pad_size = mpu.get_tensor_model_parallel_world_size() * data_pad_size_multiplier
 
     if allgather_cp:

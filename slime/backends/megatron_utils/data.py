@@ -1,9 +1,11 @@
+import os
 from collections.abc import Sequence
 
 import torch
 import torch.nn.functional as F
 from megatron.core import mpu
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.utils import get_thd_batch_on_this_cp_rank
 
 from slime.utils import accelerator
 from slime.utils.types import RolloutBatch
@@ -51,6 +53,85 @@ def get_batch(
 
     cp_size = mpu.get_context_parallel_world_size()
     cp_rank = mpu.get_context_parallel_rank()
+
+    # YuLan-Pretrain's packed THD path is the reference implementation for
+    # CP with per-sample padding.  Keep the old path available for A/B tests,
+    # but allow the actor to use the exact same partition helper without
+    # changing YuLan-Pretrain itself.
+    use_yulan_thd_cp = cp_size > 1 and os.environ.get("SLIME_USE_YULAN_THD_CP") == "1"
+    if use_yulan_thd_cp and allgather_cp:
+        raise ValueError("SLIME_USE_YULAN_THD_CP is incompatible with allgather_cp")
+
+    if use_yulan_thd_cp:
+        padded_tokens = []
+        padded_loss_masks = []
+        sequence_lengths = []
+        padded_sequence_lengths = []
+        alignment = 2 * cp_size
+        for token, loss_mask, total_length, response_length in zip(
+            tokens,
+            batch["loss_masks"],
+            batch["total_lengths"],
+            batch["response_lengths"],
+            strict=True,
+        ):
+            total_length = int(total_length)
+            response_length = int(response_length)
+            sequence_lengths.append(total_length)
+            padded_length = ((total_length + alignment - 1) // alignment) * alignment
+            padded_sequence_lengths.append(padded_length)
+            padding = padded_length - total_length
+            padded_tokens.append(F.pad(token, (0, padding), value=pad_token_id))
+            sample_loss_mask = F.pad(loss_mask, (total_length - response_length - 1, 1), value=0)
+            padded_loss_masks.append(F.pad(sample_loss_mask, (0, padding), value=0))
+
+        packed_total_tokens = sum(padded_sequence_lengths)
+        logical_total_tokens = sum(sequence_lengths)
+        # There is no source-side padding in rollout samples; the only
+        # invalid positions are the per-sample CP alignment tokens.
+        valid_total_tokens = logical_total_tokens
+        cu_seqlens = torch.zeros(
+            len(padded_sequence_lengths) + 1,
+            dtype=torch.int32,
+            device=accelerator.current_device(),
+        )
+        cu_seqlens[1:] = torch.cumsum(
+            torch.tensor(padded_sequence_lengths, dtype=torch.int32, device=cu_seqlens.device),
+            dim=0,
+        )
+        # YuLan's packed collator intentionally passes padded boundaries to
+        # both TE fields because TE cannot represent gaps between samples.
+        cu_seqlens_padded = cu_seqlens.clone()
+        global_batch = {
+            "tokens": torch.cat(padded_tokens, dim=0).unsqueeze(0),
+            "full_loss_masks": torch.cat(padded_loss_masks, dim=0).unsqueeze(0),
+            "padding_mask": torch.cat(
+                [
+                    F.pad(
+                        torch.zeros(length, dtype=torch.bool, device=token.device),
+                        (0, padded_length - length),
+                        value=True,
+                    )
+                    for length, padded_length, token in zip(
+                        sequence_lengths, padded_sequence_lengths, tokens, strict=True
+                    )
+                ],
+                dim=0,
+            ).unsqueeze(0),
+        }
+        global_batch, packed_seq_params = get_thd_batch_on_this_cp_rank(
+            global_batch,
+            cu_seqlens,
+            cu_seqlens_padded,
+            max(padded_sequence_lengths),
+            logical_total_tokens=logical_total_tokens,
+            valid_total_tokens=valid_total_tokens,
+            packed_total_tokens=packed_total_tokens,
+        )
+        batch["tokens"] = global_batch["tokens"]
+        batch["full_loss_masks"] = global_batch["full_loss_masks"]
+        batch["packed_seq_params"] = packed_seq_params
+        return batch
 
     if allgather_cp:
         # DSA mode: concatenate all sequences first, then slice once with CP.

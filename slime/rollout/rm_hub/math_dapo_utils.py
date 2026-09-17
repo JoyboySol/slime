@@ -33,7 +33,10 @@ def last_boxed_only_string(string: str) -> str | None:
     Returns:
         The last boxed expression or None if not found
     """
-    idx = string.rfind("\\boxed{")
+    # OpenCompass accepts both forms; some generated/reference solutions use
+    # ``\\fbox`` instead of ``\\boxed``.
+    boxed_markers = ("\\boxed{", "\\fbox{")
+    idx = max((string.rfind(marker) for marker in boxed_markers), default=-1)
     if idx < 0:
         return None
 
@@ -63,8 +66,8 @@ def remove_boxed(s: str) -> str:
     Returns:
         The content inside the boxed command
     """
-    left = "\\boxed{"
-    assert s[: len(left)] == left, f"box error: {s}"
+    left = "\\boxed{" if s.startswith("\\boxed{") else "\\fbox{"
+    assert s.startswith(left), f"box error: {s}"
     assert s[-1] == "}", f"box error: {s}"
     return s[len(left) : -1]
 
@@ -159,6 +162,12 @@ def normalize_final_answer(final_answer: str) -> str:
     final_answer = str(final_answer)
     final_answer = final_answer.split("=")[-1]
 
+    # Match the low-cost TeX canonicalization used by OpenCompass before the
+    # semantic math verifier.  This also makes the fallback string matcher
+    # robust when math_verify cannot parse a malformed-but-obvious fragment.
+    final_answer = final_answer.replace("\\dfrac", "\\frac").replace("\\tfrac", "\\frac")
+    final_answer = final_answer.replace("\\left", "").replace("\\right", "")
+
     # Apply substitutions and removals
     for before, after in SUBSTITUTIONS:
         final_answer = final_answer.replace(before, after)
@@ -190,7 +199,10 @@ def normalize_final_answer(final_answer: str) -> str:
 
 
 def is_correct_minerva(
-    solution_str: str, gt: str, gt_need_extract: bool = False, answer_pattern: str = r"(?i)Answer\s*:\s*([^\n]+)"
+    solution_str: str,
+    gt: str,
+    gt_need_extract: bool = False,
+    answer_pattern: str = r"(?i)(?:final\s+answer|answer)\s*(?:is\s*)?:?\s*([^\n]+)",
 ) -> tuple[bool, str]:
     """Check if the solution is correct according to Minerva criteria.
 
@@ -275,6 +287,19 @@ def _math_verify_variants(text: str) -> list[str]:
     """
     text = str(text).strip()
     variants = [text]
+
+    # ``math_verify`` does not assign the same meaning to a degree-marked
+    # number and a radian expression.  Contest data mixes e.g. ``60^\circ``
+    # and ``\pi/3``; add a mathematically equivalent radian form while
+    # retaining the original text for non-angle answers.
+    degree_match = re.fullmatch(
+        r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*(?:\^\s*\\circ|\^\s*\{\\circ\}|°)\s*",
+        text,
+    )
+    if degree_match:
+        number = degree_match.group(1)
+        radian = rf"\frac{{{number}\pi}}{{180}}"
+        variants.extend([radian, f"${radian}$", rf"\boxed{{{radian}}}"])
     has_delimiter = any(token in text for token in ("$", r"\(", r"\[", r"\boxed{"))
     looks_like_math = bool(
         re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", text)
@@ -286,7 +311,11 @@ def _math_verify_variants(text: str) -> list[str]:
 
 
 def verify(
-    solution_str: str, answer: str, strict_box_verify: bool = False, pause_tokens_index: list[int] | None = None
+    solution_str: str,
+    answer: str,
+    strict_box_verify: bool = False,
+    pause_tokens_index: list[int] | None = None,
+    prompt: str | None = None,
 ) -> bool:
     """Verify if the solution is correct.
 
@@ -302,6 +331,28 @@ def verify(
     if strict_box_verify:
         correct, pred = is_correct_strict_box(solution_str, answer, pause_tokens_index)
         return correct == 1, pred
+
+    # Multiple-choice sources in the merged corpus use both conventions:
+    # some labels are the 1-based option index (``2``), while the model often
+    # emits the corresponding letter (``B``).  This cannot be resolved from
+    # response and label alone, so use the prompt when it is available.
+    if prompt:
+        option_letters = re.findall(r"(?:\\textbf\{)?\(([A-E])\)(?:\})?", prompt, flags=re.IGNORECASE)
+        option_letters = [letter.upper() for letter in option_letters]
+        boxed = last_boxed_only_string(solution_str)
+        candidate = remove_boxed(boxed) if boxed is not None else solution_str.strip()
+        candidate = candidate.strip().strip("$ ").upper()
+        label_text = str(answer).strip().strip("$ ").upper()
+        if len(option_letters) >= 2:
+            candidate_letter = candidate if re.fullmatch(r"[A-E]", candidate) else None
+            label_letter = label_text if re.fullmatch(r"[A-E]", label_text) else None
+            if re.fullmatch(r"[1-5]", label_text):
+                index = int(label_text) - 1
+                label_letter = option_letters[index] if index < len(option_letters) else None
+            if re.fullmatch(r"[A-E]", candidate) and label_letter is not None:
+                return candidate_letter == label_letter, candidate_letter
+            if re.fullmatch(r"[1-5]", candidate) and label_letter is not None:
+                return option_letters[int(candidate) - 1] == label_letter, candidate
 
     # Prefer math-verify when available.  Unlike the original DAPO checker,
     # this handles mathematically equivalent fractions, decimals, radicals,
@@ -343,6 +394,7 @@ def compute_score(
     ground_truth: str,
     strict_box_verify: bool = False,
     pause_tokens_index: list[int] | None = None,
+    prompt: str | None = None,
 ) -> float:
     """Compute the reward score for a solution.
 
@@ -356,7 +408,7 @@ def compute_score(
         Reward score (1.0 for correct, -1.0 for incorrect)
     """
     # Verify the solution
-    correct, pred = verify(solution_str, ground_truth, strict_box_verify, pause_tokens_index)
+    correct, pred = verify(solution_str, ground_truth, strict_box_verify, pause_tokens_index, prompt=prompt)
 
     reward = 1.0 if correct else -1.0
     acc = correct

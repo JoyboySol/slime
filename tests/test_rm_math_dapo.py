@@ -49,6 +49,12 @@ def test_last_boxed_balances_nested_braces():
 
 
 @pytest.mark.unit
+def test_last_boxed_accepts_fbox():
+    assert last_boxed_only_string(r"\fbox{42}") == r"\fbox{42}"
+    assert remove_boxed(r"\fbox{42}") == "42"
+
+
+@pytest.mark.unit
 def test_last_boxed_returns_none_when_missing():
     assert last_boxed_only_string("no box") is None
 
@@ -162,6 +168,13 @@ def test_is_correct_minerva_matches_int_answer():
 
 
 @pytest.mark.unit
+def test_is_correct_minerva_accepts_answer_is():
+    correct, pred = is_correct_minerva("The answer is 42", "42")
+    assert correct is True
+    assert pred == "42"
+
+
+@pytest.mark.unit
 def test_is_correct_minerva_takes_last_answer_match():
     """Multiple ``Answer:`` lines → ``re.findall`` returns the list and
     the function picks ``[-1]`` (line 201). Pinning this means a model
@@ -216,6 +229,20 @@ def test_verify_accepts_bare_latex_fraction_label():
     prediction = r"\boxed{-\dfrac{1}{4}}"
     label = r"-\frac{1}{4}"
     correct, _ = verify(prediction, label)
+    assert correct is True
+
+
+@pytest.mark.unit
+def test_verify_maps_multiple_choice_letter_to_numeric_label():
+    prompt = r"Compute the value. \textbf{(A)} 16:9 \textbf{(B)} 9:16 \textbf{(C)} 4:3"
+    correct, pred = verify(r"\boxed{B}", "2", prompt=prompt)
+    assert correct is True
+    assert pred == "B"
+
+
+@pytest.mark.unit
+def test_verify_accepts_degree_and_radian_equivalence():
+    correct, _ = verify(r"\boxed{60^\circ}", r"\frac{\pi}{3}")
     assert correct is True
 
 

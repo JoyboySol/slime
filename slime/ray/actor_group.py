@@ -96,7 +96,6 @@ class RayTrainGroup:
         # We cannot do routing replay for critic.
         if self.args.use_routing_replay and self.role == "actor":
             env_vars["ENABLE_ROUTING_REPLAY"] = "1"
-
         if self._actor_cls is None:
             from slime.backends.megatron_utils.actor import MegatronTrainRayActor
 

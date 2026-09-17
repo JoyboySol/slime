@@ -620,6 +620,7 @@ def train_one_step(
                 labels=None,
                 packed_seq_params=batch["packed_seq_params"],
                 loss_mask=batch["full_loss_masks"],
+                padding_mask=batch.get("padding_mask"),
             )
         else:
             forward_kwargs = {
@@ -629,6 +630,7 @@ def train_one_step(
                 "labels": None,
                 "packed_seq_params": batch["packed_seq_params"],
                 "loss_mask": batch["full_loss_masks"],
+                "padding_mask": batch.get("padding_mask"),
             }
 
             if batch["multimodal_train_inputs"] is not None:
