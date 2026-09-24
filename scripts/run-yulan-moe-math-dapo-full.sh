@@ -5,7 +5,7 @@ set -euo pipefail
 SLIME_ROOT=/mnt/yulan/lvzhihao/PostTrain/slime
 POSTTRAIN_ROOT=/mnt/yulan/lvzhihao/PostTrain
 YULAN_ROOT=${POSTTRAIN_ROOT}/YuLan-Pretrain
-ROUTE_REPLAY_PATCH=${SLIME_ROOT}/.ai/route_replay_yulan_pretrain.patch
+ROUTE_REPLAY_PATCH=${SLIME_ROOT}/patches/route_replay_yulan_pretrain.patch
 ROUTE_REPLAY_TARGETS=(
    megatron/core/transformer/moe/moe_utils.py
    megatron/core/transformer/moe/router.py
@@ -69,11 +69,11 @@ export SAVE_INTERVAL=20
 export MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU:-1024}
 export ROLLOUT_MAX_RESPONSE_LEN=${ROLLOUT_MAX_RESPONSE_LEN:-16384}
 export ROLLOUT_MAX_CONTEXT_LEN=32768
-export ROLLOUT_TEMPERATURE=0.7
+export ROLLOUT_TEMPERATURE=${ROLLOUT_TEMPERATURE:-0.7}
 export ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-32}
 export N_SAMPLES_PER_PROMPT=8
 export GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-256}
-export OVER_SAMPLING_BATCH_SIZE=${OVER_SAMPLING_BATCH_SIZE:-48}
+export OVER_SAMPLING_BATCH_SIZE=${OVER_SAMPLING_BATCH_SIZE:-32}
 export NUM_ROLLOUT=${NUM_ROLLOUT:-446}
 
 mkdir -p "$(dirname "${RUN_LOG_FILE}")"
@@ -89,7 +89,7 @@ mkdir -p "$(dirname "${RUN_LOG_FILE}")"
    --eval-input-key prompt \
    --eval-label-key label \
    --n-samples-per-eval-prompt 2 \
-   --eval-temperature 0.7 \
+   --eval-temperature "${EVAL_TEMPERATURE:-${ROLLOUT_TEMPERATURE}}" \
    --eval-max-prompt-len 1024 \
    --eval-max-response-len "${EVAL_MAX_RESPONSE_LEN:-16384}" \
    --eval-max-context-len 32768 \

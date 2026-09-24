@@ -24,7 +24,7 @@ The main entrypoints are:
 - `scripts/run-yulan-moe-base-math-smoke.sh`: Ray submission and model/rollout argument assembly.
 - `scripts/models/yulan-moe-base.sh`: Qwen3-Next/YuLan hybrid MoE model definition.
 
-Preserve unrelated working-tree changes. Do not permanently edit YuLan-Pretrain for a slime experiment: use `.ai/route_replay_yulan_pretrain.patch`; the full launcher applies it only when needed and reverses it on exit.
+Preserve unrelated working-tree changes. Do not permanently edit YuLan-Pretrain for a slime experiment: use `patches/route_replay_yulan_pretrain.patch`; the full launcher applies it only when needed and reverses it on exit.
 
 ## What differs from origin/main
 
