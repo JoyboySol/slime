@@ -119,7 +119,7 @@ ALGORITHM_ARGS=(
    --advantage-estimator grpo
    --kl-coef 0
    --kl-loss-coef 0
-   --entropy-coef 0
+   --entropy-coef "${ENTROPY_COEF:-0}"
    --eps-clip 0.2
    --eps-clip-high 0.28
 )
@@ -228,11 +228,10 @@ if [[ "${COLOCATE:-0}" == "1" ]]; then
    fi
 fi
 
-# Ray jobs do not automatically inherit submitter-side credentials.  Pass the
-# W&B credential through the runtime environment without putting it in the
-# command line or repository files.  Disable xtrace while expanding the secret.
+# Keep W&B credentials in the Ray worker user's ~/.netrc. Do not put the key in
+# Ray runtime_env: Ray exposes runtime environment variables in job metadata.
 set +x
-RUNTIME_ENV_JSON="{\"env_vars\":{\"WANDB_API_KEY\":\"${WANDB_API_KEY:-}\",\"SLIME_USE_YULAN_THD_CP\":\"${SLIME_USE_YULAN_THD_CP:-0}\",\"SLIME_USE_YULAN_TRANSFORMER_BLOCK\":\"${SLIME_USE_YULAN_TRANSFORMER_BLOCK:-0}\"}}"
+RUNTIME_ENV_JSON="{\"env_vars\":{\"SLIME_USE_YULAN_THD_CP\":\"${SLIME_USE_YULAN_THD_CP:-0}\",\"SLIME_USE_YULAN_TRANSFORMER_BLOCK\":\"${SLIME_USE_YULAN_TRANSFORMER_BLOCK:-0}\"}}"
 
 # Keep xtrace disabled through submission: Ray's command echo would otherwise
 # print the W&B credential embedded in runtime_env_json.

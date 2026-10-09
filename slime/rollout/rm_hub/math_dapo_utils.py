@@ -352,7 +352,10 @@ def verify(
             if re.fullmatch(r"[A-E]", candidate) and label_letter is not None:
                 return candidate_letter == label_letter, candidate_letter
             if re.fullmatch(r"[1-5]", candidate) and label_letter is not None:
-                return option_letters[int(candidate) - 1] == label_letter, candidate
+                candidate_index = int(candidate) - 1
+                if candidate_index >= len(option_letters):
+                    return False, candidate
+                return option_letters[candidate_index] == label_letter, candidate
 
     # Prefer math-verify when available.  Unlike the original DAPO checker,
     # this handles mathematically equivalent fractions, decimals, radicals,

@@ -1,0 +1,23 @@
+# Local Python environment is used by the submitting host, not uploaded.
+.venv/
+
+# Runtime outputs and caches are not source dependencies.
+outputs/
+__pycache__/
+.pytest_cache/
+.rayignore
+
+# Large local datasets and generated rollout artifacts are available locally
+# and must not be included in the Ray Jobs working-directory package.
+yongxiang/data/*
+!yongxiang/data/apps_eval_100_seed42.jsonl
+*.pt
+*.log
+*.tar
+*.tar.gz
+
+# Repository metadata and editor/build caches.
+.git/
+.mypy_cache/
+.ruff_cache/
+*.so

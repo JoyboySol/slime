@@ -1,0 +1,131 @@
+# Effective defaults assembled from:
+#   scripts/run-yulan-moe-math-dapo-full.sh
+#   scripts/run-yulan-moe-base-math-smoke.sh
+#   scripts/models/yulan-moe-base.sh
+# Values that support environment overrides are the defaults when unset.
+
+model:
+  name: qwen3_next
+  custom_provider: slime_plugins.models.yulan_moe.model_provider
+  hf_checkpoint: /mnt/yulan/lvzhihao/PostTrain/models/YuLan-MoE-Base
+  mcore_checkpoint: /mnt/yulan/lvzhihao/PostTrain/models/YuLan-MoE-Base/mcore-tp1pp1ep8-sqrtgate-hybrid0625-05
+  layers: 56
+  hidden_size: 2048
+  ffn_hidden_size: 4800
+  attention_heads: 32
+  query_groups: 8
+  kv_channels: 64
+  norm: RMSNorm
+  norm_epsilon: 1.0e-6
+  vocab_size: 99000
+  max_position_embeddings: 49152
+  num_experts: 192
+  moe_ffn_hidden_size: 512
+  moe_shared_expert_intermediate_size: 512
+  moe_router_topk: 4
+  moe_router_score_function: softmax
+  moe_router_dtype: fp32
+  linear_attention_type: gated_delta_net
+  linear_conv_kernel_dim: 4
+  linear_num_key_heads: 8
+  linear_num_value_heads: 32
+  linear_key_head_dim: 64
+  linear_value_head_dim: 64
+
+training:
+  algorithm: grpo
+  reward_type: dapo
+  global_batch_size: 256
+  micro_batch_size: 1
+  learning_rate: 2.0e-6
+  lr_decay_style: constant
+  weight_decay: 0.1
+  adam_beta1: 0.9
+  adam_beta2: 0.98
+  precision_aware_optimizer: true
+  exp_avg_dtype: bf16
+  exp_avg_sq_dtype: bf16
+  kl_coef: 0
+  kl_loss_coef: 0
+  entropy_coef: 0
+  eps_clip: 0.2
+  eps_clip_high: 0.28
+  dynamic_batch_size: true
+  max_tokens_per_gpu: 1024
+  num_rollout: 446
+  save_interval: 20
+  checkpoint_retention_count: 2
+  checkpoint_retention_interval: 20
+  save_optimizer: false
+  save_rng: false
+
+rollout:
+  prompt_data: /mnt/yulan/lvzhihao/PostTrain/data/hf_data/AIME_like_data_judgeable/aime_like_judgeable.jsonl
+  input_key: query
+  label_key: answer
+  apply_chat_template: true
+  prompt_suffix: "\n\nPlease reason step by step, and put your final answer within \\boxed{}."
+  batch_size: 32
+  n_samples_per_prompt: 8
+  over_sampling_batch_size: 32
+  shuffle: true
+  temperature: 0.7
+  max_prompt_len: 1024
+  max_response_len: 16384
+  max_context_len: 32768
+  dynamic_sampling_filter: slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std_with_fallback
+  use_routing_replay: true
+  num_gpus: 8
+  num_gpus_per_engine: 2
+  num_engines: 4
+  tensor_parallel_size: 2
+  expert_parallel_size: 2
+  dtype: bfloat16
+  router_policy: round_robin
+  mem_fraction_static: 0.7
+  cuda_graph_batch_sizes: [1, 2, 4, 8]
+  max_running_requests_per_engine: 8
+
+parallelism:
+  actor_nodes: 1
+  actor_gpus_per_node: 8
+  tensor_model_parallel_size: 1
+  pipeline_model_parallel_size: 1
+  context_parallel_size: 8
+  expert_model_parallel_size: 8
+  expert_tensor_parallel_size: 1
+  recompute_granularity: full
+  recompute_method: uniform
+  recompute_num_layers: 1
+
+evaluation:
+  interval: 2
+  prompt_data:
+    aime2024: /mnt/yulan/lvzhihao/PostTrain/data/aime-2024.jsonl
+    aime2025: /mnt/yulan/lvzhihao/PostTrain/data/aime-2025.jsonl
+  input_key: prompt
+  label_key: label
+  n_samples_per_prompt: 2
+  temperature: 0.7
+  max_prompt_len: 1024
+  max_response_len: 16384
+  max_context_len: 32768
+
+runtime:
+  use_yulan_thd_cp: true
+  use_yulan_transformer_block: true
+  auto_generate_cu_seqlens: true
+  colocate: true
+  destroy_rollout_engines: true
+  rebuild_train_actors: true
+  wandb: true
+  wandb_mode: online
+  wandb_project: yulan-moe-math-rl
+  wandb_group: yulan-moe-dapo-full-cp8
+  output_root: /mnt/yulan/lvzhihao/PostTrain/outputs/yulan_moe_math_dapo_full_cp8_20260914
+  save_hf_template: "${OUTPUT_ROOT}/hf/rollout_{rollout_id}"
+  run_log_file: /mnt/yulan/lvzhihao/PostTrain/outputs/logs/yulan_moe_math_dapo_full_cp8_20260914.log
+
+# Additional CLI arguments are appended by the launcher via "$@" and can
+# override parser defaults above. Environment overrides are documented inline
+# in the launcher (for example GLOBAL_BATCH_SIZE, NUM_ROLLOUT, OUTPUT_ROOT).

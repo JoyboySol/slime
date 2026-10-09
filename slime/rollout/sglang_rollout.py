@@ -260,11 +260,27 @@ async def generate_and_rm(
     sampling_params: dict[str, Any],
     evaluation: bool = False,
 ) -> Sample | list[Sample]:
+    async def evaluate_reward(item: Sample):
+        metadata = item.metadata if isinstance(item.metadata, dict) else {}
+        if evaluation and metadata.get("dataset") == "mbppplus":
+            # MBPP+ eval uses its dataset-owned slime plugin explicitly. This
+            # avoids global/batched RM routing from selecting another judge.
+            from yongxiang.mbppplus_slime_rm import reward as mbppplus_reward
+
+            return await mbppplus_reward(args, item)
+        return await async_rm(args, item)
+
     # mask previous off-policy generation for partial rollout
     if args.partial_rollout and args.mask_offpolicy_in_partial_rollout and sample.response_length > 0:
         sample.loss_mask = [0] * sample.response_length
 
     # For samples with existing response, check if they're complete
+    if evaluation and (sample.status == Sample.Status.COMPLETED or sample.status == Sample.Status.TRUNCATED):
+        assert sample.response is not None
+        if not args.group_rm:
+            sample.reward = await evaluate_reward(sample)
+        return sample
+
     if sample.status == Sample.Status.COMPLETED or sample.status == Sample.Status.TRUNCATED:
         assert sample.response is not None
         if not args.group_rm:
@@ -316,7 +332,7 @@ async def generate_and_rm(
         # Some custom generate paths may have already filled the reward.
         if sample.reward is None:
             with trace_span(sample, "reward_model"):
-                sample.reward = await async_rm(args, sample)
+                sample.reward = await evaluate_reward(sample)
 
     return sample
 

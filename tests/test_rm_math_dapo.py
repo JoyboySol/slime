@@ -241,6 +241,14 @@ def test_verify_maps_multiple_choice_letter_to_numeric_label():
 
 
 @pytest.mark.unit
+def test_verify_rejects_numeric_choice_outside_prompt_options():
+    prompt = r"Choose one. (A) first (B) second (C) third (D) fourth"
+    correct, pred = verify(r"\boxed{5}", "2", prompt=prompt)
+    assert correct is False
+    assert pred == "5"
+
+
+@pytest.mark.unit
 def test_verify_accepts_degree_and_radian_equivalence():
     correct, _ = verify(r"\boxed{60^\circ}", r"\frac{\pi}{3}")
     assert correct is True

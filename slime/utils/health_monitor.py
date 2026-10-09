@@ -2,6 +2,7 @@ import logging
 import threading
 
 import ray
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,8 @@ class RolloutHealthMonitor:
 
     def __init__(self, server_group, args):
         self._server_group = server_group
+        self._router_ip = args.sglang_router_ip
+        self._router_port = args.sglang_router_port
 
         self._thread = None
         self._stop_event = None
@@ -126,12 +129,26 @@ class RolloutHealthMonitor:
                 break
 
     def _run_health_checks(self) -> None:
+        self._log_router_workers()
         for rollout_engine_id, engine in enumerate(self._server_group.engines):
             if self._stop_event is not None and self._stop_event.is_set():
                 break
             if self._pause_event is not None and self._pause_event.is_set():
                 break
             self._check_engine_health(rollout_engine_id, engine)
+
+    def _log_router_workers(self) -> None:
+        if not self._router_ip or not self._router_port:
+            logger.warning("Router worker snapshot unavailable: router address is not configured")
+            return
+
+        url = f"http://{self._router_ip}:{self._router_port}/workers"
+        try:
+            response = requests.get(url, timeout=self._check_timeout)
+            response.raise_for_status()
+            logger.info("Router worker snapshot: %s", response.json())
+        except Exception:
+            logger.exception("Failed to fetch router worker snapshot from %s", url)
 
     def _check_engine_health(self, rollout_engine_id, engine) -> None:
         if engine is None:
@@ -142,11 +159,14 @@ class RolloutHealthMonitor:
             ray.get(engine.health_generate.remote(timeout=self._check_timeout))
         except Exception as e:
             logger.error(
-                f"Health check failed for rollout engine {rollout_engine_id} (ray timeout or error). Killing actor. Exception: {e}"
+                "Health check failed for rollout engine %s (ray timeout or error). "
+                "Killing actor. Exception: %s",
+                rollout_engine_id,
+                e,
             )
             self._kill_engine(rollout_engine_id=rollout_engine_id)
         else:
-            logger.debug(f"Health check passed for rollout engine {rollout_engine_id}")
+            logger.info("Health check passed for rollout engine %s", rollout_engine_id)
 
     def _kill_engine(self, rollout_engine_id: int):
         logger.info(f"Killing server group {rollout_engine_id}...")

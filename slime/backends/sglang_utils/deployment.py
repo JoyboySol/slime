@@ -37,6 +37,7 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
     router_args.port = router_port
     router_args.prometheus_port = find_available_port(random.randint(4000, 5000))
     router_args.request_timeout_secs = args.sglang_router_request_timeout_secs
+    router_args.request_id_headers = ["x-request-id"]
 
     if has_pd_disaggregation:
         router_args.pd_disaggregation = True

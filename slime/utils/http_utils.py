@@ -5,6 +5,8 @@ import logging
 import os
 import random
 import socket
+import time
+import uuid
 
 import httpx
 
@@ -146,12 +148,26 @@ def _next_actor():
 
 async def _post(client, url, payload, max_retries=60, headers=None):
     retry_count = 0
+    request_headers = dict(headers or {})
+    if url.endswith("/generate"):
+        request_headers.setdefault("x-request-id", uuid.uuid4().hex)
+    request_id = request_headers.get("x-request-id")
+    request_started = time.monotonic()
     while retry_count < max_retries:
         response = None
         try:
-            response = await client.post(url, json=payload or {}, headers=headers)
+            response = await client.post(url, json=payload or {}, headers=request_headers)
             response.raise_for_status()
             content = await response.aread()
+            elapsed = time.monotonic() - request_started
+            if elapsed >= 30:
+                logger.warning(
+                    "Slow HTTP POST succeeded: request_id=%s, status=%s, elapsed=%.1fs, url=%s",
+                    request_id,
+                    response.status_code,
+                    elapsed,
+                    url,
+                )
             try:
                 output = json.loads(content)
             except json.JSONDecodeError:
@@ -160,12 +176,24 @@ async def _post(client, url, payload, max_retries=60, headers=None):
             retry_count += 1
 
             if isinstance(e, httpx.HTTPStatusError):
-                response_text = e.response.text
+                response_text = e.response.text[:2048]
+                response_headers = {
+                    name: e.response.headers[name]
+                    for name in ("x-request-id", "retry-after", "server")
+                    if name in e.response.headers
+                }
+                status_code = e.response.status_code
             else:
                 response_text = None
+                response_headers = {}
+                status_code = None
 
             logger.info(
-                f"Error: {e}, retrying... (attempt {retry_count}/{max_retries}, url={url}, response={response_text})"
+                "HTTP POST failed: "
+                f"request_id={request_id}, status={status_code}, "
+                f"elapsed={time.monotonic() - request_started:.1f}s, error={e}, "
+                f"attempt={retry_count}/{max_retries}, url={url}, "
+                f"response_headers={response_headers}, response={response_text!r}"
             )
             if retry_count >= max_retries:
                 logger.info(f"Max retries ({max_retries}) reached, failing... (url={url})")

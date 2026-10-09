@@ -9,6 +9,7 @@ logger = logging.getLogger(__name__)
 from slime.utils.misc import load_function
 from slime.utils.types import Sample
 
+from .code_utils import compute_score as compute_score_code
 from .deepscaler import get_deepscaler_rule_based_reward
 from .f1 import f1_score
 from .gpqa import compute_gpqa_reward
@@ -78,6 +79,8 @@ async def async_rm(args, sample: Sample, **kwargs):
         return get_deepscaler_rule_based_reward(response, label)
     elif rm_type == "dapo":
         return compute_score_dapo(response, label, prompt=sample.prompt)
+    elif rm_type == "code":
+        return compute_score_code(response, label, prompt=sample.prompt)
     elif rm_type == "math":
         return 1 if grade_answer_verl(response, label) else 0
     elif rm_type == "f1":
@@ -101,6 +104,11 @@ async def batched_async_rm(
     samples: list[Sample],
     **kwargs,
 ) -> list[int | float]:
+    # Evaluation datasets may provide a per-sample reward function. Preserve
+    # that override in batched rollouts instead of silently routing samples to
+    # the global --custom-rm-path implementation.
+    if any(sample.custom_rm_path for sample in samples):
+        return await asyncio.gather(*(async_rm(args, sample, **kwargs) for sample in samples))
     if args.custom_rm_path is not None:
         # Ensure the custom reward function is implemented in batch mode
         rm_function = load_function(args.custom_rm_path)

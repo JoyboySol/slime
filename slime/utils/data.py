@@ -281,13 +281,21 @@ class Dataset:
                 metadata["tools"] = tools
 
             if apply_chat_template:
+                chat_template_kwargs = apply_chat_template_kwargs or {}
                 output_prompt = tokenizer.apply_chat_template(
                     prompt,
                     tools=tools,
                     tokenize=False,
                     add_generation_prompt=True,
-                    **(apply_chat_template_kwargs or {}),
+                    **chat_template_kwargs,
                 )
+                # Some shipped Qwen3-compatible templates ignore the
+                # ``enable_thinking`` kwarg and always append an opening
+                # ``<think>`` marker. When callers explicitly disable
+                # thinking, remove that marker at the template boundary so
+                # generation starts in the answer channel.
+                if chat_template_kwargs.get("enable_thinking") is False and output_prompt.endswith("<think>\n"):
+                    output_prompt = output_prompt[: -len("<think>\n")]
             else:
                 output_prompt = prompt
 

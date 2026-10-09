@@ -11,8 +11,14 @@ ROUTE_REPLAY_TARGETS=(
    megatron/core/transformer/moe/router.py
 )
 
-if [[ -z "${WANDB_API_KEY:-}" ]]; then
-   echo "WANDB_API_KEY must be exported before starting full training." >&2
+if ! awk '
+   { for (i = 1; i <= NF; i++) {
+      if ($i == "machine") { active = ($(i + 1) == "api.wandb.ai"); i++; continue }
+      if (active && $i == "password" && $(i + 1) != "") found = 1
+   } }
+   END { exit !found }
+' "$HOME/.netrc" 2>/dev/null; then
+   echo "A W&B API key must be configured in this user's ~/.netrc before starting full training." >&2
    exit 2
 fi
 
@@ -22,7 +28,7 @@ for required_path in \
    "${ROUTE_REPLAY_PATCH}" \
    "${POSTTRAIN_ROOT}/models/YuLan-MoE-Base/config.json" \
    "${POSTTRAIN_ROOT}/models/YuLan-MoE-Base/mcore-tp1pp1ep8-sqrtgate-hybrid0625-05/latest_checkpointed_iteration.txt" \
-   "${POSTTRAIN_ROOT}/data/hf_data/AIME_like_data_judgeable/aime_like_judgeable.jsonl" \
+   "${POSTTRAIN_ROOT}/data/hf_data/math_rl_mid_high_20k_20260924/rollout_20k.jsonl" \
    "${POSTTRAIN_ROOT}/data/aime-2024.jsonl" \
    "${POSTTRAIN_ROOT}/data/aime-2025.jsonl"; do
    if [[ ! -e "${required_path}" ]]; then

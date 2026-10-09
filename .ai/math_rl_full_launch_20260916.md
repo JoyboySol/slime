@@ -124,3 +124,38 @@ rollout/dynamic_filter/drop_*
 rollout/zero_std/count_*
 train/global_batch_size
 ```
+
+## SGLang rollout 并发与 503 排查记录（2026-09-25）
+
+### 现象与结论
+
+2026-09-25 的 mid/high 难度数据全量任务出现 rollout 请求长时间不返回、SGLang Router 反复重试并最终返回 HTTP 503。排查后发现，客户端请求并发上限与 SGLang engine 的处理并发不匹配，是导致请求堆积和重试放大的主要原因：
+
+```text
+旧配置：sglang_server_concurrency 默认 512
+rollout engines：4
+slime semaphore 上限：512 × 4 = 2048 个并发请求
+SGLang：每个 engine max_running_requests=8
+总 running slots：4 × 8 = 32
+```
+
+rollout 会为每组 prompt 并行提交 `n_samples_per_prompt=8` 个生成请求；客户端 semaphore 的 2048 上限远高于 32 个 engine running slots，缺少有效的客户端背压。旧任务日志中 engine 的 `#queue-req` 曾升至数十，Router 出现大量 `Retry backoff`；最终客户端记录到 101 个 HTTP 503。GPU 仍在工作，因此现象不是 GPU 空闲或 rollout actor 未启动。现有日志能确认并发不匹配及排队/重试现象，但不足以断定 Router 内部首先触发的具体超时原因。
+
+### 处理与复查
+
+重启任务时显式加入：
+
+```bash
+--sglang-server-concurrency 8
+```
+
+此时 slime semaphore 上限为 `8 × 4 = 32`，与 4 个 engine 各 8 个 running slots 对齐；`over_sampling_batch_size=32` 保持不变。2026-09-25 新任务早期日志已观察到 HTTP 200、eval 进度前进，engine 队列基本为 0，且观察窗口内未见 503 或 Router retry。慢请求仍有约 138 秒延迟，所以这属于早期验证，不能仅凭启动阶段认定长期吞吐问题彻底解决。
+
+```text
+旧任务：raysubmit_fidQ4zFTTtQ291Xk（已停止）
+新任务：raysubmit_fxWhr97st1pQXLAz（启动时仍在运行）
+新任务输出：/mnt/yulan/lvzhihao/PostTrain/outputs/yulan_moe_math_dapo_mid_high_20k_full_cp8_20260925_reqdiag_conc8
+新任务日志：/mnt/yulan/lvzhihao/PostTrain/outputs/logs/yulan_moe_math_dapo_mid_high_20k_full_cp8_20260925_reqdiag_conc8.log
+```
+
+后续排查优先同时检查 `sglang_server_concurrency`、每个 engine 的 `max_running_requests`、`#queue-req`、Router retry/503 和成功请求延迟。不要只看 GPU 利用率判断 rollout 是否健康。
