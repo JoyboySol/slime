@@ -38,11 +38,11 @@ for required_path in \
 done
 
 patch_applied_by_launcher=0
-if git -C "${YULAN_ROOT}" diff --quiet -- "${ROUTE_REPLAY_TARGETS[@]}"; then
+if git -C "${YULAN_ROOT}" apply --reverse --check "${ROUTE_REPLAY_PATCH}" >/dev/null 2>&1; then
+   echo "YuLan route-replay patch is already applied; leaving it applied after launch."
+elif git -C "${YULAN_ROOT}" diff --quiet -- "${ROUTE_REPLAY_TARGETS[@]}"; then
    git -C "${YULAN_ROOT}" apply "${ROUTE_REPLAY_PATCH}"
    patch_applied_by_launcher=1
-elif git -C "${YULAN_ROOT}" apply --reverse --check "${ROUTE_REPLAY_PATCH}" >/dev/null 2>&1; then
-   echo "YuLan route-replay patch is already applied; leaving it applied after launch."
 else
    echo "YuLan route-replay targets have unrelated local changes; refusing to overwrite them." >&2
    git -C "${YULAN_ROOT}" status --short -- "${ROUTE_REPLAY_TARGETS[@]}" >&2

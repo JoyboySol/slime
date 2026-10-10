@@ -231,7 +231,7 @@ fi
 # Keep W&B credentials in the Ray worker user's ~/.netrc. Do not put the key in
 # Ray runtime_env: Ray exposes runtime environment variables in job metadata.
 set +x
-RUNTIME_ENV_JSON="{\"env_vars\":{\"SLIME_USE_YULAN_THD_CP\":\"${SLIME_USE_YULAN_THD_CP:-0}\",\"SLIME_USE_YULAN_TRANSFORMER_BLOCK\":\"${SLIME_USE_YULAN_TRANSFORMER_BLOCK:-0}\"}}"
+RUNTIME_ENV_JSON="$("${SLIME_ROOT}/.venv/bin/python" -c 'import json, os; keys = ("SLIME_USE_YULAN_THD_CP", "SLIME_USE_YULAN_TRANSFORMER_BLOCK", "PYTHONPATH", "PATH", "LD_LIBRARY_PATH", "SGLANG_EXTERNAL_MODEL_PACKAGE", "MOE_ROUTER_SQRT_GATE", "CUDA_HOME", "CUDA_DEVICE_MAX_CONNECTIONS", "TORCH_CUDA_ARCH_LIST", "TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "MASTER_ADDR"); print(json.dumps({"env_vars": {key: os.environ[key] for key in keys if key in os.environ}}))')"
 
 # Keep xtrace disabled through submission: Ray's command echo would otherwise
 # print the W&B credential embedded in runtime_env_json.
