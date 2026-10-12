@@ -38,12 +38,14 @@
 
 ### 2. 验证 Slime actor 的前向、反向和保存
 
-- [ ] 用短序列和固定样本执行 actor 前向、loss、反向及一次 optimizer update。
-- [ ] 检查 loss、梯度和更新后参数均为有限值；确认不是只完成初始化而没有实际更新。
-- [ ] 保存更新后的 MCore checkpoint，并验证可重新加载。
-- [ ] 验证 HF 权重导出/Slime 权重转换路径覆盖 128k 模型特有模块。
+- [x] 用短序列和固定样本执行 actor 前向、loss、反向及一次 optimizer update。
+- [x] 检查 loss、梯度和更新后参数均为有限值；确认不是只完成初始化而没有实际更新。
+- [x] 保存更新后的 MCore checkpoint，并验证可重新加载。
+- [x] 验证 HF 权重导出/Slime 权重转换路径覆盖 128k 模型特有模块。
 
 **验收：**actor 完成一次真实更新；更新前后 checkpoint 可保存、重载，关键参数没有丢失。
+
+**阶段 2 已验证：**在 8 卡 A100、TP1/PP1/CP8/EP8 上，从 SGLang 生成 rollout，再回放固定 rollout 执行 actor update。使用 2 个 prompt、每个 4 个样本，response cap 1024、context cap 4096；该短样本用于验证训练链路，生成结果全部触及 response cap 并标记为 truncated，不用于判断回答质量。actor 完成前向、loss、反向和 optimizer update，loss、grad norm 均为有限值；更新后的 MCore checkpoint 已保存并通过独立 load-only 作业重载。HF 导出成功写出 128 个 safetensors 分片，扫描 32,226 个张量后确认所有浮点值有限。为适配当前 YuLan GatedNorm/GDN 和 attention-output-gate 布局，转换器覆盖了 final/input/pre-MLP GatedNorm、GDN fused 与 split q/k/v/z/beta/alpha 投影，以及 gated QKV bias。阶段 3 的 SGLang 权重加载和 logprob 对齐仍待验证。
 
 ### 3. 验证 Slime 到 SGLang 的权重和 logprob 一致性
 
