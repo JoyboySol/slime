@@ -1,0 +1,2728 @@
+diff --git a/.ai/eval_math_rl_rollout.py b/.ai/eval_math_rl_rollout.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b527e0f9f599ad9d6e1100e6d65716814c070701
+--- /dev/null
++++ b/.ai/eval_math_rl_rollout.py
+@@ -0,0 +1,89 @@
++import json
++import os
++from pathlib import Path
++
++from sglang import Engine
++from slime.rollout.rm_hub.math_dapo_utils import compute_score
++from transformers import AutoTokenizer
++
++
++ROOT = Path("/mnt/yulan/lvzhihao/PostTrain/data/hf_data/math_rl_mid_high_20k_20260924")
++MODEL = Path("/mnt/yulan/lvzhihao/PostTrain/outputs/yulan_moe_math_dapo_full_cp8_rebuild_20260914/hf/rollout_67")
++INPUT = ROOT / os.environ.get("MATH_EVAL_INPUT", "eval_100.jsonl")
++RUN_TAG = os.environ.get("MATH_EVAL_RUN_TAG", "eval")
++SAMPLES_PER_QUERY = int(os.environ.get("MATH_EVAL_SAMPLES", "2"))
++
++
++def main():
++    os.environ.setdefault("SGLANG_EXTERNAL_MODEL_PACKAGE", "sglang_qwen3_next_plugin")
++    tokenizer = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
++    rows = [json.loads(line) for line in INPUT.open()]
++    worker_id = int(os.environ.get("MATH_EVAL_WORKER_ID", "0"))
++    worker_count = int(os.environ.get("MATH_EVAL_WORKER_COUNT", "1"))
++    rows = [row for row in rows if row["eval_id"] % worker_count == worker_id]
++    prompts = []
++    for row in rows:
++        prompt = tokenizer.apply_chat_template(
++            [{"role": "user", "content": row["query"]}],
++            tokenize=False,
++            add_generation_prompt=True,
++        )
++        prompts.extend([prompt] * SAMPLES_PER_QUERY)
++
++    engine = Engine(
++        model_path=str(MODEL),
++        trust_remote_code=True,
++        tp_size=2,
++        ep_size=2,
++        dtype="bfloat16",
++        mem_fraction_static=0.7,
++        json_model_override_args='{"moe_router_sqrt_gate":true}',
++        max_running_requests=32,
++        log_level="warning",
++    )
++    try:
++        outputs = engine.generate(
++            prompts,
++            sampling_params={"temperature": 0.7, "top_p": 1.0, "max_new_tokens": 8192},
++        )
++    finally:
++        engine.shutdown()
++
++    results = []
++    for i, row in enumerate(rows):
++        generations = []
++        for attempt in range(SAMPLES_PER_QUERY):
++            response = outputs[SAMPLES_PER_QUERY * i + attempt]["text"]
++            score = compute_score(response, row["answer"], prompt=row["query"])
++            generations.append({"response": response, **score})
++        results.append({**row, "generations": generations})
++    output = ROOT / f"{RUN_TAG}_worker_{worker_id}.jsonl"
++    with output.open("w") as f:
++        for row in results:
++            f.write(json.dumps(row, ensure_ascii=False) + "\n")
++
++    total_correct = sum(g["acc"] for row in results for g in row["generations"])
++    avg_accuracy = total_correct / (SAMPLES_PER_QUERY * len(results))
++    pass_at_n = sum(any(g["acc"] for g in row["generations"]) for row in results) / len(results)
++    valid_group_ratio = sum(
++        any(g["acc"] for g in row["generations"]) and not all(g["acc"] for g in row["generations"])
++        for row in results
++    ) / len(results)
++    summary = {
++        "model": str(MODEL),
++        "num_questions": len(results),
++        "samples_per_question": SAMPLES_PER_QUERY,
++        "total_responses": SAMPLES_PER_QUERY * len(results),
++        "correct_responses": int(total_correct),
++        "avg_accuracy": avg_accuracy,
++        f"pass_at_{SAMPLES_PER_QUERY}": pass_at_n,
++        "valid_group_count": int(round(valid_group_ratio * len(results))),
++        "valid_group_ratio": valid_group_ratio,
++        "result_file": str(output),
++    }
++    (ROOT / f"{RUN_TAG}_worker_{worker_id}_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
++    print(json.dumps(summary, indent=2))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/.ai/math_rl_full_launch_20260916.md b/.ai/math_rl_full_launch_20260916.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..e7b6ac66178492cc38a197cdd4f515b7aba09a68
+--- /dev/null
++++ b/.ai/math_rl_full_launch_20260916.md
+@@ -0,0 +1,161 @@
++# Math RL 全量训练启动说明（2026-09-16）
++
++## 当前任务
++
++```text
++Ray job: raysubmit_Mrt5iZsxHMW3mwpF
++状态: RUNNING
++```
++
++启动脚本：
++
++```text
++/mnt/yulan/lvzhihao/PostTrain/slime/scripts/run-yulan-moe-math-dapo-full.sh
++```
++
++## 启动命令
++
++在 Slime 环境中执行以下命令。W&B key 需要提前通过环境变量传入，不要写入脚本或日志：
++
++```bash
++export WANDB_API_KEY='<your-wandb-api-key>'
++export GLOBAL_BATCH_SIZE=256
++export ROLLOUT_BATCH_SIZE=32
++export OVER_SAMPLING_BATCH_SIZE=64
++export NUM_ROLLOUT=446
++export OUTPUT_ROOT=/mnt/yulan/lvzhihao/PostTrain/outputs/yulan_moe_math_dapo_full_cp8_rebuild_20260916
++export RUN_LOG_FILE=/mnt/yulan/lvzhihao/PostTrain/outputs/logs/yulan_moe_math_dapo_full_cp8_rebuild_20260916.log
++
++cd /mnt/yulan/lvzhihao/PostTrain/slime
++./scripts/run-yulan-moe-math-dapo-full.sh
++```
++
++后台启动示例：
++
++```bash
++setsid bash -c '
++  export WANDB_API_KEY="<your-wandb-api-key>"
++  export GLOBAL_BATCH_SIZE=256
++  export ROLLOUT_BATCH_SIZE=32
++  export OVER_SAMPLING_BATCH_SIZE=64
++  export NUM_ROLLOUT=446
++  export OUTPUT_ROOT=/mnt/yulan/lvzhihao/PostTrain/outputs/yulan_moe_math_dapo_full_cp8_rebuild_20260916
++  export RUN_LOG_FILE=/mnt/yulan/lvzhihao/PostTrain/outputs/logs/yulan_moe_math_dapo_full_cp8_rebuild_20260916.log
++  cd /mnt/yulan/lvzhihao/PostTrain/slime
++  exec ./scripts/run-yulan-moe-math-dapo-full.sh
++' </dev/null > /mnt/yulan/lvzhihao/PostTrain/outputs/logs/yulan_moe_math_dapo_full_cp8_rebuild_20260916_launcher.log 2>&1 &
++```
++
++## 关键配置
++
++```text
++训练：GRPO + DAPO reward
++global_batch_size=256
++rollout_batch_size=32
++n_samples_per_prompt=8
++over_sampling_batch_size=64
++num_rollout=446
++
++actor：TP=1, PP=1, CP=8, EP=8
++max_tokens_per_gpu=1024
++auto-generate-cu-seqlens 开启
++动态 microbatch 开启
++
++rollout：8 张 GPU，4 个 engine，每个 engine TP=2、EP=2
++temperature=0.7
++max_prompt_len=1024
++max_response_len=31744
++
++eval：每 2 个 rollout step 一次
++AIME2024：/mnt/yulan/lvzhihao/PostTrain/data/aime-2024.jsonl
++AIME2025：/mnt/yulan/lvzhihao/PostTrain/data/aime-2025.jsonl
++n_samples_per_eval_prompt=2
++
++routing replay：--use-routing-replay
++rollout routing replay：关闭
++train actor：每轮训练后释放并重建
++```
++
++## 重要启动逻辑
++
++```text
++rollout 生成 64 组候选
++→ DAPO 动态过滤 zero-reward-std group
++→ 保留 32 组进入训练（256 条 response）
++→ 销毁 SGLang engine
++→ 创建 train actor 并训练
++→ 保存 MCore/HF checkpoint
++→ 释放 train actor
++→ 重建 SGLang engine
++→ 下一轮 rollout
++```
++
++当前正式训练不使用 `--use-rollout-routing-replay`，因为已验证该参数会造成 SGLang 与 MCore 路由不一致，使训推 logprob 差异显著增大。
++
++## 输出与日志
++
++```text
++输出：/mnt/yulan/lvzhihao/PostTrain/outputs/yulan_moe_math_dapo_full_cp8_rebuild_20260916
++主日志：/mnt/yulan/lvzhihao/PostTrain/outputs/logs/yulan_moe_math_dapo_full_cp8_rebuild_20260916.log
++W&B 目录：/mnt/yulan/lvzhihao/PostTrain/outputs/wandb
++```
++
++HF checkpoint 模板：
++
++```text
++${OUTPUT_ROOT}/hf/rollout_{rollout_id}
++```
++
++MCore/HF checkpoint 保留策略：最近 2 个，以及每 20 个 rollout 的周期性 checkpoint。
++
++## 监控与停止
++
++```bash
++/mnt/yulan/lvzhihao/PostTrain/slime/.venv/bin/ray job status raysubmit_Mrt5iZsxHMW3mwpF
++tail -f /mnt/yulan/lvzhihao/PostTrain/outputs/logs/yulan_moe_math_dapo_full_cp8_rebuild_20260916.log
++/mnt/yulan/lvzhihao/PostTrain/slime/.venv/bin/ray job stop raysubmit_Mrt5iZsxHMW3mwpF
++```
++
++重点观察：
++
++```text
++train/train_rollout_logprob_abs_diff
++rollout/dynamic_filter/drop_*
++rollout/zero_std/count_*
++train/global_batch_size
++```
++
++## SGLang rollout 并发与 503 排查记录（2026-09-25）
++
++### 现象与结论
++
++2026-09-25 的 mid/high 难度数据全量任务出现 rollout 请求长时间不返回、SGLang Router 反复重试并最终返回 HTTP 503。排查后发现，客户端请求并发上限与 SGLang engine 的处理并发不匹配，是导致请求堆积和重试放大的主要原因：
++
++```text
++旧配置：sglang_server_concurrency 默认 512
++rollout engines：4
++slime semaphore 上限：512 × 4 = 2048 个并发请求
++SGLang：每个 engine max_running_requests=8
++总 running slots：4 × 8 = 32
++```
++
++rollout 会为每组 prompt 并行提交 `n_samples_per_prompt=8` 个生成请求；客户端 semaphore 的 2048 上限远高于 32 个 engine running slots，缺少有效的客户端背压。旧任务日志中 engine 的 `#queue-req` 曾升至数十，Router 出现大量 `Retry backoff`；最终客户端记录到 101 个 HTTP 503。GPU 仍在工作，因此现象不是 GPU 空闲或 rollout actor 未启动。现有日志能确认并发不匹配及排队/重试现象，但不足以断定 Router 内部首先触发的具体超时原因。
++
++### 处理与复查
++
++重启任务时显式加入：
++
++```bash
++--sglang-server-concurrency 8
++```
++
++此时 slime semaphore 上限为 `8 × 4 = 32`，与 4 个 engine 各 8 个 running slots 对齐；`over_sampling_batch_size=32` 保持不变。2026-09-25 新任务早期日志已观察到 HTTP 200、eval 进度前进，engine 队列基本为 0，且观察窗口内未见 503 或 Router retry。慢请求仍有约 138 秒延迟，所以这属于早期验证，不能仅凭启动阶段认定长期吞吐问题彻底解决。
++
++```text
++旧任务：raysubmit_fidQ4zFTTtQ291Xk（已停止）
++新任务：raysubmit_fxWhr97st1pQXLAz（启动时仍在运行）
++新任务输出：/mnt/yulan/lvzhihao/PostTrain/outputs/yulan_moe_math_dapo_mid_high_20k_full_cp8_20260925_reqdiag_conc8
++新任务日志：/mnt/yulan/lvzhihao/PostTrain/outputs/logs/yulan_moe_math_dapo_mid_high_20k_full_cp8_20260925_reqdiag_conc8.log
++```
++
++后续排查优先同时检查 `sglang_server_concurrency`、每个 engine 的 `max_running_requests`、`#queue-req`、Router retry/503 和成功请求延迟。不要只看 GPU 利用率判断 rollout 是否健康。
+diff --git "a/.ai/math_rl_\345\275\223\345\211\215\345\244\204\345\242\203\344\270\216\345\220\257\345\212\250\350\257\264\346\230\216_20260914.md" "b/.ai/math_rl_\345\275\223\345\211\215\345\244\204\345\242\203\344\270\216\345\220\257\345\212\250\350\257\264\346\230\216_20260914.md"
+index 19d021b178d8aa4ccb5dc7f14720b3f3c1527266..e861312e4aa6a805d6877c8ff86667ecb50cbaf7 100644
+--- "a/.ai/math_rl_\345\275\223\345\211\215\345\244\204\345\242\203\344\270\216\345\220\257\345\212\250\350\257\264\346\230\216_20260914.md"
++++ "b/.ai/math_rl_\345\275\223\345\211\215\345\244\204\345\242\203\344\270\216\345\220\257\345\212\250\350\257\264\346\230\216_20260914.md"
+@@ -210,7 +210,7 @@ IndexError: RoutingReplay.all_routing_replays[routing_replay_offset]
+ 使用 patch：
+ 
+ ```text
+-/mnt/yulan/lvzhihao/PostTrain/slime/.ai/routing_replay_megatron.patch
++/mnt/yulan/lvzhihao/PostTrain/slime/patches/routing_replay_megatron.patch
+ ```
+ 
+ 该 patch 注入两处逻辑：
+@@ -271,7 +271,7 @@ B2 的任务最后因为 smoke 命令同时设置了 `--rebuild-train-actors` 
+ ### 已应用
+ 
+ ```text
+-.ai/routing_replay_megatron.patch
++patches/routing_replay_megatron.patch
+ ```
+ 
+ 当前 YuLan-Pretrain 工作树中的对应文件包含 route replay hook：
+@@ -284,7 +284,7 @@ B2 的任务最后因为 smoke 命令同时设置了 `--rebuild-train-actors` 
+ ### 不应应用
+ 
+ ```text
+-.ai/transformer_engine_fused_adam_chunked.patch
++patches/transformer_engine_fused_adam_chunked.patch
+ ```
+ 
+ 该 patch 只属于之前 TE FusedAdam OOM 的尝试，不应注入 route replay 实验或正式全量训练。
+@@ -297,7 +297,7 @@ SGLang 当前运行时已经支持返回 routed experts，日志中出现：
+ enable_return_routed_experts=True
+ ```
+ 
+-`.ai/sglang_routing_replay.patch` 不能直接对当前 `sglang_qwen3_next_plugin` 工作树应用，因为 patch 中的路径与当前插件目录结构不完全一致；当前实际启用的是已经存在的 SGLang 返回 routed experts 接口。
++`patches/sglang_routing_replay.patch` 不能直接对当前 `sglang_qwen3_next_plugin` 工作树应用，因为 patch 中的路径与当前插件目录结构不完全一致；当前实际启用的是已经存在的 SGLang 返回 routed experts 接口。
+ 
+ ## 5. 当前主要风险
+ 
+@@ -318,3 +318,336 @@ enable_return_routed_experts=True
+ 5. 修复后再以 `global_batch=8` 做 A/B，最后才扩大到 `global_batch=256`。
+ 
+ 在 route replay 指标稳定低于 `0.1` 之前，不建议把 `--use-rollout-routing-replay` 直接加入全量训练。
++
++## 7. CP=1 与 CP=8 对照结果（2026-09-14）
++
++使用同一份已经保存的 rollout：
++
++```text
++/mnt/yulan/lvzhihao/PostTrain/outputs/yulan_moe_current_fresh_route_ab_20260914/rollouts/rollout_0.pt
++```
++
++固定条件：
++
++```text
++TP=1, PP=1, EP=8
++route replay=True
++rollout temperature=0.7
++global batch=8
++max response=2048
++max tokens per GPU=1536
++```
++
++只改变 context parallel size：
++
++| 配置 | `train/train_rollout_logprob_abs_diff` | 结果 |
++| --- | ---: | --- |
++| CP=8 + route replay | `0.83622557` | forward-only smoke 成功 |
++| CP=1 + route replay | `0.04035386` | forward-only smoke 成功 |
++
++CP=1 相比 CP=8 将差异降低约 95%，并且进入了可接受的数量级。这是目前最强的定位证据：
++
++1. HF 权重加载、MCore 权重、温度 `0.7` 和 route replay 基本不是主因；
++2. CP=8 的问题位于 CP token/layout 对齐或 hybrid/GDN 模型的 CP forward 路径；
++3. 当前不能仅凭这个结果断言是 `slice_log_prob_with_cp` 单点 bug，因为 CP=8 还会改变模型实际 forward 的 ring/zigzag attention 路径；
++4. CP=1 结果是 forward-only，optimizer step 被临时跳过，不能直接等价为完整 RL 训练已经通过。
++
++相关日志：
++
++```text
++/mnt/yulan/lvzhihao/PostTrain/outputs/logs/yulan_moe_route_replay_cp1_forwardonly_20260914.log
++/mnt/yulan/lvzhihao/PostTrain/outputs/logs/yulan_moe_diag_breakdown_replay_forced_20260914.log
++```
++
++CP=1 的 per-token debug 导出实验随后被手动终止，未将未完成结果纳入结论。
++
++当前建议：先以 `CP=1 + EP=8 + route replay` 作为稳定基线，再分别对 CP=8 的 token 重排、response logprob slice、loss mask 和 GDN/attention CP forward 做单项诊断。不要在 CP=8 问题未定位前恢复正式全量训练。
++
++## 8. CP 前向差异的进一步定位（2026-09-14）
++
++在同一份 rollout 和同一份 HF 权重上，保存了 CP=1/8 的逐 token 训练前向结果：
++
++```text
++/mnt/yulan/lvzhihao/PostTrain/outputs/yulan_moe_route_replay_cp1_debug_complete_20260914/train_0.pt
++/mnt/yulan/lvzhihao/PostTrain/outputs/yulan_moe_route_replay_cp8_debug_complete_20260914/train_0.pt
++/mnt/yulan/lvzhihao/PostTrain/outputs/yulan_moe_noreplay_cp8_debug_complete_20260914/train_0.pt
++```
++
++关键事实：
++
++1. CP=1 与 CP=8 的 8 条样本的 token、`loss_mask`、response 位置和样本顺序完全一致，因此不是 batch 拼接、response slice 或 debug 聚合造成的假象。
++2. CP=1 + route replay 的逐样本平均绝对差约为 `0.025--0.054`；CP=8 + route replay 约为 `0.538--1.450`，且每个样本都明显偏大。
++3. CP=8 关闭 route replay 后仍约为 `0.556--2.481`，说明主要问题是 CP=8 的模型前向本身；route replay 只能带来部分改善，不是根因。
++4. 关闭 `gdn_cp_run_level_layout` 和 `gdn_cp_use_token_exchange` 后，CP=8 + replay 仍为 `0.83532459`；临时补齐 `PackedSeqParams` 的 packed/valid/cumulative metadata 后仍为 `0.83530140`。因此这两个开关及简单 metadata 缺失均不是充分解释。
++
++对应日志：
++
++```text
++/mnt/yulan/lvzhihao/PostTrain/outputs/logs/yulan_moe_route_replay_cp8_nogdnrunlevel_20260914.log
++/mnt/yulan/lvzhihao/PostTrain/outputs/logs/yulan_moe_route_replay_cp8_metadata_diag_20260914.log
++/mnt/yulan/lvzhihao/PostTrain/outputs/logs/yulan_moe_route_replay_cp1_debug_complete_20260914.log
++/mnt/yulan/lvzhihao/PostTrain/outputs/logs/yulan_moe_route_replay_cp8_debug_complete_20260914.log
++/mnt/yulan/lvzhihao/PostTrain/outputs/logs/yulan_moe_noreplay_cp8_debug_complete_20260914.log
++```
++
++当前结论收敛为：差异发生在 CP=8 的 attention/RoPE/THD token layout forward 路径，已排除输入 token、loss mask、response 位置、logprob 聚合和单纯 route replay 开关。下一步应直接对比 YuLan 的标准 `get_thd_batch_on_this_cp_rank` 与 Slime 当前自建 `PackedSeqParams`/CP slicing 的语义，重点检查 CP 分片的顺序、`cu_seqlens` 的局部/全局含义以及 RoPE 的位置索引。正式训练暂不使用 CP=8。
++
++所有诊断用的 optimizer 跳过逻辑和 YuLan route replay 临时修改均已恢复；YuLan-Pretrain 的原有未提交修改保持不变。
++
++## 9. `cu_seqlens` 假设实验（2026-09-14）
++
++为检验 Slime 在已手工 CP 重排后的 THD token 上是否错误使用了“原始长度” cumulative offsets，临时将 `data.py` 中的：
++
++```python
++torch.tensor(cu_seqlens) * cp_size
++```
++
++改成不乘 CP 的本地 offsets，并在 CP=8、route replay、同一份 rollout 下运行完整 forward/backward（optimizer 临时跳过）。结果：
++
++```text
++train/train_rollout_logprob_abs_diff = 0.8361760377883911
++log: /mnt/yulan/lvzhihao/PostTrain/outputs/logs/yulan_moe_cp8_local_cu_diag_20260914c.log
++debug: /mnt/yulan/lvzhihao/PostTrain/outputs/yulan_moe_cp8_local_cu_diag_20260914c/train_0.pt
++```
++
++与原始 CP=8 + replay 的约 `0.8362` 没有实质变化，故排除“仅由 `cu_seqlens * cp_size` 引起”的解释。实验中还确认：
++
++- 不启动 SGLang、直接复用保存的 rollout 可以稳定进入 actor train；
++- 前向/backward 成功，失败的 optimizer OOM 仍是独立的 TE FusedAdam state 初始化峰值；
++- 本次使用的 local-cumulative-offset 诊断、optimizer skip 和 route replay 临时 hook 均已恢复。
++
++当前 CP 根因范围进一步收敛到：CP interleaved token 的实际 partition/index 语义、attention 的 causal/ring 通信，以及 RoPE/THD 位置索引之间的组合，而不是单一 cu-seqlens 缩放或 loss 指标聚合。
++
++## 10. GDN `chunk` 与 `cp2hp` 隔离实验（2026-09-14）
++
++又做了一次 CP=8、EP=8、route replay、同一份 rollout 的实现级 A/B：
++
++| GDN CP 实现 | 额外设置 | `train/train_rollout_logprob_abs_diff` |
++| --- | --- | ---: |
++| `chunk` | run-level layout + token exchange | `0.836176`（前一实验基线） |
++| `cp2hp` | 关闭 chunk 专属开关，关闭 auto-generate-cu-seqlens | `0.835329` |
++
++`cp2hp` 只带来约 `0.00085` 的微小变化，不能解释 CP=8 相对 CP=1 的 `0.04 -> 0.836` 差异。因此根因不局限于 GDN 的 chunk/token-exchange 实现；CP 下游 attention/THD layout 或 CP 前向整体仍是主要嫌疑。
++
++本实验日志和 debug 文件：
++
++```text
++/mnt/yulan/lvzhihao/PostTrain/outputs/logs/yulan_moe_cp8_cp2hp_diag_20260914.log
++/mnt/yulan/lvzhihao/PostTrain/outputs/yulan_moe_cp8_cp2hp_diag_20260914/train_0.pt
++```
++
++注意：两次实现级 A/B 均临时跳过了 TE FusedAdam 的 optimizer step，仅用于比较 actor forward/backward 的 logprob；最终配置和源码均已恢复。
++
++## 11. Unfused attention 隔离（2026-09-14）
++
++尝试将 CP=8 的 attention backend 从 `flash` 切换为 `unfused`，但在第一个 attention 层即失败：
++
++```text
++ValueError: No dot product attention backend is available for the provided inputs.
++```
++
++日志：
++
++```text
++/mnt/yulan/lvzhihao/PostTrain/outputs/logs/yulan_moe_cp8_unfused_attn_diag_20260914.log
++```
++
++这不是数值 A/B 结果，而是当前 TE + THD + CP 输入组合没有可用的 unfused backend；不能据此判定 flash attention 正确或错误。默认 attention 配置已恢复为 `flash`。
++
++## 12. CP×EP 隔离与索引验证（2026-09-14）
++
++补充验证了两点：
++
++1. 用 8-rank torchrun 对 `transformer_engine.pytorch.cpp_extensions.thd_get_partitioned_indices` 与 Slime 的 `slice_with_cp` 做了单样本、多样本对照，含当前各样本长度和 padding，所有 CP rank 的索引均完全一致。
++2. 尝试 CP=8、EP=1 以去掉 MoE EP all-to-all，但模型初始化阶段每卡需要约 `34,070,910,080` 参数，随后在分配约 `63.46 GiB` 参数/梯度 buffer 时 OOM；该实验没有进入前向，不能作为数值结论。
++
++日志：
++
++```text
++/mnt/yulan/lvzhihao/PostTrain/outputs/logs/yulan_moe_cp8_ep1_diag_20260914.log
++```
++
++因此当前尚不能把问题归因于 EP all-to-all；已确认的有效结论仍是 CP=8 的实际 forward 与 CP=1 不一致，而输入与 CP index 生成正确。EP=1 仅因显存不可行而被排除。
++
++## 13. YuLan 标准 THD/CP 适配实验（2026-09-14）
++
++为验证“直接复用 YuLan-Pretrain 的 CP 实现”是否能解决问题，在 Slime 中增加了可选环境开关 `SLIME_USE_YULAN_THD_CP=1`，不修改 YuLan-Pretrain 源码。该分支：
++
++- 每条样本按 `2*CP` 对齐后再 pack；
++- 调用 YuLan 的 `get_thd_batch_on_this_cp_rank` 做 TE THD 分片；
++- 同时分片 tokens、loss mask 和 padding mask；
++- 在 Slime 的 YuLan Mamba model provider 中补传 `packed_seq_params`/`padding_mask` 到 GDN/MoE TransformerLayer。原 provider 之前直接丢弃了这两个 Transformer-specific 参数，因此仅替换数据切分并不能真正进入 YuLan 的标准 CP forward。
++
++实验日志：
++
++```text
++/mnt/yulan/lvzhihao/PostTrain/outputs/logs/yulan_moe_cp8_yulan_thd_diag_20260914.log
++/mnt/yulan/lvzhihao/PostTrain/outputs/logs/yulan_moe_cp8_yulan_thd_replay_diag_20260914.log
++/mnt/yulan/lvzhihao/PostTrain/outputs/logs/yulan_moe_cp8_yulan_thd_replay_diag2_20260914.log
++/mnt/yulan/lvzhihao/PostTrain/outputs/logs/yulan_moe_cp8_yulan_thd_replay_diag3_20260914.log
++/mnt/yulan/lvzhihao/PostTrain/outputs/logs/yulan_moe_cp8_yulan_thd_replay_diag4_20260914.log
++```
++
++结果与发现：
++
++1. 仅使用标准 THD 分片、未启用 replay 时，前向可以跑通，指标为 `0.8756659`；它没有把 CP=8 偏差降到 CP=1 的水平，因此“TE partition index 不一致”不是唯一根因。
++2. 第一版标准 THD + replay 暴露了明确的布局错误：replay top-k 行数与 router logits 不一致（`1536/1438`）。随后补齐了每样本 alignment padding、`padding_mask` 以及 provider 参数传递。
++3. 补齐后 replay 的第一 microbatch 已通过，不再出现长度断言；但第二 microbatch 在 CP collective 长时间不推进，实验被主动终止，尚未证明 CP=8 已稳定。
++4. 当前结论不是“CP=8 已可用”，而是：YuLan 标准 CP 路径是必要方向，但需要继续隔离 Mamba/GDN 的 run-level CP 状态与多 microbatch 重置/同步问题。CP=1 + replay 仍是现阶段稳定基线。
++
++本轮临时注入 YuLan route replay hook 已恢复；YuLan-Pretrain 的原有未提交修改保持不变。Slime 的标准 THD 分支仍通过环境变量关闭，未改变默认旧路径。
++
++## 14. Block-level GDN CP 修复验证（2026-09-14）
++
++继续追踪后确认，之前的卡点不是 rollout、route replay、loss mask 或 `cu_seqlens` 聚合，而是模型封装层级：Slime 的 `_YuLanMambaStack` 把 GDN 包成单个 `TransformerLayer`，逐层直接调用；YuLan 的 `TransformerBlock` 才实现了 GDN CP 所需的整段 layer-loop 协议，包括：
++
++- GDN interleaved 与 sequential-chunk layout 的转换；
++- 每层对应的 `valid_token_mask`/MoE padding mask；
++- `gdn_cp_sequential_cu_seqlens` 和 pre-GDR plan identity 的生命周期；
++- 每个 microbatch 后的 GDN runtime state 清理。
++
++因此只把 `packed_seq_params` 传进单层可以让第一个 microbatch 通过，但第二个 microbatch 可能出现 collective 顺序或 layout state 不一致。这就是之前“第一步 50% 后卡住”的根因范围。
++
++本轮在 Slime provider 中加入默认关闭的 `SLIME_USE_YULAN_TRANSFORMER_BLOCK=1` 分支：复用 YuLan 的 `TransformerBlock` run-level CP 实现，不改变 checkpoint key。使用同一份 rollout 和 route replay，配置为 CP=8、EP=8、TP=1、两个 microbatch，结果完整通过：
++
++需要特别注明：第 14 节这次成功实验的启动命令没有带 `--use-routing-replay` 和 `--use-rollout-routing-replay`；日志中的 `use_routing_replay` 与 `use_rollout_routing_replay` 均为 `False`。这里的“route replay”只表示实验背景/数据来源，不表示该次 actor 训练实际启用了这两个开关。
++
++```text
++train/train_rollout_logprob_abs_diff = 0.04671185836195946
++actor train: 2/2 microbatches
++Ray job succeeded
++```
++
++完整日志：
++
++```text
++/mnt/yulan/lvzhihao/PostTrain/outputs/logs/yulan_moe_cp8_transformer_block_replay_complete_20260914.log
++```
++
++输出：
++
++```text
++/mnt/yulan/lvzhihao/PostTrain/outputs/yulan_moe_cp8_transformer_block_replay_20260914
++/mnt/yulan/lvzhihao/PostTrain/outputs/yulan_moe_cp8_transformer_block_replay_20260914/hf
++```
++
++该运行还完成了 MCore 与 HF 保存，并确认 actor 清理后 SGLang engine 可重新创建。第一次同配置实验的唯一失败是启动参数缺少 `--save-hf`，而 `--rebuild-train-actors` 要求该参数；不是训练或 CP 失败。
++
++route replay 的 YuLan 注入已整理成可重复应用的 patch：
++
++```text
++/mnt/yulan/lvzhihao/PostTrain/slime/patches/route_replay_yulan_pretrain.patch
++```
++
++已用 `git apply --check` 验证，且当前 YuLan-Pretrain 的 route 文件已恢复干净；用户原有的 YuLan 未提交修改保持不变。正式运行 CP8 时应同时临时应用该 patch，并设置 `SLIME_USE_YULAN_THD_CP=1` 与 `SLIME_USE_YULAN_TRANSFORMER_BLOCK=1`。默认不打开 block-level 分支，避免未经验证的 PP/VPP 组合误用；当前验证覆盖的是 TP=1、PP=1、CP=8、EP=8。
++
++## 15. 固定 microbatch 对照实验（2026-09-14）
++
++第 14 节的 CP8 成功实验不能解释为“CP8 在任意 microbatch 编排下都稳定”。两次实验都使用 `global_batch_size=8`、CP=8、EP=8、TransformerBlock 和 route replay，但 microbatch 编排不同：
++
++| 实验 | dynamic batch | 实际 actor microbatch 数 | abs diff | 结果 |
++| --- | --- | ---: | ---: | --- |
++| 第 14 节成功实验 | 开启，`max_tokens_per_gpu=1536` | 2 | `0.04671186` | 成功 |
++| 固定 batch 实验 | 关闭，`micro_batch_size=1` | 8 | `1.17349577` | 训练流程成功但训推不一致 |
++
++固定 batch 实验日志：
++
++```text
++/mnt/yulan/lvzhihao/PostTrain/outputs/logs/yulan_moe_fixed_global8_cp8_yulanblock_20260914.log
++```
++
++这说明 dynamic microbatch 本身不是根因；真正的差异是 CP8/GDN block-level runtime 在多个 microbatch 连续执行时仍可能产生状态或 layout 不一致。之前第 14 节的成功只覆盖 2 个 microbatch，不能外推到全量训练中约 179 个 microbatch 的情况。下一步应保持固定数据，比较第 1、2、3... 个 microbatch 的逐 token logprob，定位状态从哪个 microbatch 开始漂移。
++
++## 16. 第 14 节复现实验校验（2026-09-14）
++
++按第 14 节的 CP=8、EP=8、TP=1、`use_dynamic_batch_size=True`、`max_tokens_per_gpu=1536`、global batch=8、实际 2 个 microbatch 条件重新启动了一次，任务完整成功：
++
++```text
++Ray job: raysubmit_WGgaMzzq6aAeddF3
++日志: /mnt/yulan/lvzhihao/PostTrain/outputs/logs/yulan_moe_cp8_transformer_block_replay_repro14_20260914.log
++输出: /mnt/yulan/lvzhihao/PostTrain/outputs/yulan_moe_cp8_transformer_block_replay_repro14_20260914
++actor train: 2/2 microbatches
++train/train_rollout_logprob_abs_diff = 1.3123672008514404
++```
++
++但这次不是严格复现第 14 节：新实验命令包含了 `--use-routing-replay --use-rollout-routing-replay`，而第 14 节原始成功日志中的参数为：
++
++```text
++use_routing_replay ............... False
++use_rollout_routing_replay ....... False
++```
++
++因此，`1.3123672` 只能说明“在开启 replay 开关时，2 个 dynamic microbatch 仍可完成训练但训推差异很大”，不能用来否定第 14 节的结果，也不能把差异归因于 dynamic microbatch。下一步应去掉这两个 replay 开关，保持其余命令逐字一致，再做真正的 A/B：
++
++1. 原第 14 节配置（replay off）应验证是否回到约 `0.04671186`；
++2. 仅打开 Slime/YuLan routing replay，其他参数不变，比较 abs diff；
++3. 两次都复用同一个 `rollout_0.pt`，并记录 route 文件 git 状态。
++
++## 17. Routing replay 差异根因定位（2026-09-14）
++
++完成了同一份 rollout、同一套 CP=8/EP=8、dynamic microbatch、2 个 microbatch 的三组对照：
++
++| 实验 | routing replay | rollout routing replay | abs diff | 结果 |
++| --- | --- | --- | ---: | --- |
++| 严格第 14 节复现 | 关 | 关 | `0.04640966` | 成功 |
++| actor replay only | 开 | 关 | `0.04690091` | 成功 |
++| rollout route replay | 开 | 开 | `1.31236720` | 成功但严重不一致 |
++
++因此可以排除：
++
++- `RoutingReplay` 的 forward/backward 记录与消费机制本身；
++- CP=8 下 dynamic microbatch 的一般训练流程；
++- actor-only 的 replay hook。
++
++进一步在 actor-only 的自然 MCore 路由与 rollout 路由之间做了 CP 变换后的逐层逐 microbatch 对比。以 rank 0 为例：
++
++```text
++compared=335232
++mismatched=281090
++element mismatch fraction=0.838494
++set_mismatched_rows=73605
++order_only_rows=3684
++```
++
++其他 rank 的 element mismatch 约 `0.897`。更重要的是，`set_mismatched_rows` 约占全部 token-row 的 `88%`，不是单纯 top-k 顺序不同，而是 rollout/SGLang 与 MCore 自然计算出的专家集合本身大面积不同。这个诊断使用的临时 compare hook 已在实验后移除，不会进入正常训练路径。
++
++当前最可信的根因范围已经从“replay 状态机”收敛到“rollout 路由与 actor 路由的语义不一致”，重点包括：
++
++1. SGLang `routed_experts` 的 token/layout 顺序与 YuLan THD CP 的 TE partition 是否完全一致；
++2. SGLang EP=2 返回的 expert id 与 MCore EP=8 dispatcher 所需的全局 expert id 是否一致；
++3. SGLang 与 MCore 的 sqrt-gate/router score、router dtype、top-k selection 是否完全一致；
++4. rollout capture 的层号/路由行是否与 actor 的 54 个 MoE layer 顺序一致。
++
++在这四项未验证前，不应把 `--use-rollout-routing-replay` 加入正式训练。`--use-routing-replay` 单独开启目前不会造成指标恶化，但它只会 replay MCore 自己记录的路由，不能解决 SGLang 与 actor 的训推路由差异。
++
++## 18. 全量训练配置调整（2026-09-14）
++
++根据第 17 节的 A/B 结果，正式全量启动脚本已调整为：
++
++```text
++--use-routing-replay
++```
++
++并移除：
++
++```text
++--use-rollout-routing-replay
++```
++
++原因是 rollout/SGLang 路由与 MCore actor 路由的专家集合存在大面积不一致；继续把 rollout expert id 注入 actor 会使 `train_rollout_logprob_abs_diff` 从约 `0.046` 放大到 `1.31`。保留 actor-side routing replay 不会显著改变指标，它只重放 MCore 自己在 forward 中记录的路由，可作为稳定的训练路径；当前版本不再强制使用尚未完成语义对齐的 SGLang rollout 路由。
++
++对应脚本：`scripts/run-yulan-moe-math-dapo-full.sh`。本次只修改 Slime 启动配置，没有修改或提交 YuLan-Pretrain 源码。
++
++## 19. 全量训练启用 train actor 释放（2026-09-14）
++
++为避免上一轮“actor train 完成后 train actor 仍占用 GPU，随后重启 SGLang OOM”的问题，全量启动脚本进一步改为：
++
++```text
++DESTROY_ROLLOUT_ENGINES=1
++REBUILD_TRAIN_ACTORS=1
++SAVE_HF=${OUTPUT_ROOT}/hf/rollout_{rollout_id}
++```
++
++启用 `--rebuild-train-actors` 后，每轮 actor train 保存当前 MCore/HF 快照并真正 `ray.kill` train actor，之后才重建 SGLang；下一轮 rollout 前再从最新 HF 快照重建 actor。`SAVE_HF` 是该选项的必需参数。
++
++脚本仍使用 `--checkpoint-retention-count 2` 和 `--checkpoint-retention-interval 20`，因此 MCore 与 HF 快照都只保留最近两个以及每 20 个 rollout 的周期性快照，不会因为每轮重建而无限占用磁盘。
+diff --git a/.ai/run-yulan-moe-math-dapo-full-hyperparameters.yaml b/.ai/run-yulan-moe-math-dapo-full-hyperparameters.yaml
+new file mode 100644
+index 0000000000000000000000000000000000000000..65292931a4fa9fe569eaf3b3018911b9a0616cbb
+--- /dev/null
++++ b/.ai/run-yulan-moe-math-dapo-full-hyperparameters.yaml
+@@ -0,0 +1,131 @@
++# Effective defaults assembled from:
++#   scripts/run-yulan-moe-math-dapo-full.sh
++#   scripts/run-yulan-moe-base-math-smoke.sh
++#   scripts/models/yulan-moe-base.sh
++# Values that support environment overrides are the defaults when unset.
++
++model:
++  name: qwen3_next
++  custom_provider: slime_plugins.models.yulan_moe.model_provider
++  hf_checkpoint: /mnt/yulan/lvzhihao/PostTrain/models/YuLan-MoE-Base
++  mcore_checkpoint: /mnt/yulan/lvzhihao/PostTrain/models/YuLan-MoE-Base/mcore-tp1pp1ep8-sqrtgate-hybrid0625-05
++  layers: 56
++  hidden_size: 2048
++  ffn_hidden_size: 4800
++  attention_heads: 32
++  query_groups: 8
++  kv_channels: 64
++  norm: RMSNorm
++  norm_epsilon: 1.0e-6
++  vocab_size: 99000
++  max_position_embeddings: 49152
++  num_experts: 192
++  moe_ffn_hidden_size: 512
++  moe_shared_expert_intermediate_size: 512
++  moe_router_topk: 4
++  moe_router_score_function: softmax
++  moe_router_dtype: fp32
++  linear_attention_type: gated_delta_net
++  linear_conv_kernel_dim: 4
++  linear_num_key_heads: 8
++  linear_num_value_heads: 32
++  linear_key_head_dim: 64
++  linear_value_head_dim: 64
++
++training:
++  algorithm: grpo
++  reward_type: dapo
++  global_batch_size: 256
++  micro_batch_size: 1
++  learning_rate: 2.0e-6
++  lr_decay_style: constant
++  weight_decay: 0.1
++  adam_beta1: 0.9
++  adam_beta2: 0.98
++  precision_aware_optimizer: true
++  exp_avg_dtype: bf16
++  exp_avg_sq_dtype: bf16
++  kl_coef: 0
++  kl_loss_coef: 0
++  entropy_coef: 0
++  eps_clip: 0.2
++  eps_clip_high: 0.28
++  dynamic_batch_size: true
++  max_tokens_per_gpu: 1024
++  num_rollout: 446
++  save_interval: 20
++  checkpoint_retention_count: 2
++  checkpoint_retention_interval: 20
++  save_optimizer: false
++  save_rng: false
++
++rollout:
++  prompt_data: /mnt/yulan/lvzhihao/PostTrain/data/hf_data/AIME_like_data_judgeable/aime_like_judgeable.jsonl
++  input_key: query
++  label_key: answer
++  apply_chat_template: true
++  prompt_suffix: "\n\nPlease reason step by step, and put your final answer within \\boxed{}."
++  batch_size: 32
++  n_samples_per_prompt: 8
++  over_sampling_batch_size: 32
++  shuffle: true
++  temperature: 0.7
++  max_prompt_len: 1024
++  max_response_len: 16384
++  max_context_len: 32768
++  dynamic_sampling_filter: slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std_with_fallback
++  use_routing_replay: true
++  num_gpus: 8
++  num_gpus_per_engine: 2
++  num_engines: 4
++  tensor_parallel_size: 2
++  expert_parallel_size: 2
++  dtype: bfloat16
++  router_policy: round_robin
++  mem_fraction_static: 0.7
++  cuda_graph_batch_sizes: [1, 2, 4, 8]
++  max_running_requests_per_engine: 8
++
++parallelism:
++  actor_nodes: 1
++  actor_gpus_per_node: 8
++  tensor_model_parallel_size: 1
++  pipeline_model_parallel_size: 1
++  context_parallel_size: 8
++  expert_model_parallel_size: 8
++  expert_tensor_parallel_size: 1
++  recompute_granularity: full
++  recompute_method: uniform
++  recompute_num_layers: 1
++
++evaluation:
++  interval: 2
++  prompt_data:
++    aime2024: /mnt/yulan/lvzhihao/PostTrain/data/aime-2024.jsonl
++    aime2025: /mnt/yulan/lvzhihao/PostTrain/data/aime-2025.jsonl
++  input_key: prompt
++  label_key: label
++  n_samples_per_prompt: 2
++  temperature: 0.7
++  max_prompt_len: 1024
++  max_response_len: 16384
++  max_context_len: 32768
++
++runtime:
++  use_yulan_thd_cp: true
++  use_yulan_transformer_block: true
++  auto_generate_cu_seqlens: true
++  colocate: true
++  destroy_rollout_engines: true
++  rebuild_train_actors: true
++  wandb: true
++  wandb_mode: online
++  wandb_project: yulan-moe-math-rl
++  wandb_group: yulan-moe-dapo-full-cp8
++  output_root: /mnt/yulan/lvzhihao/PostTrain/outputs/yulan_moe_math_dapo_full_cp8_20260914
++  save_hf_template: "${OUTPUT_ROOT}/hf/rollout_{rollout_id}"
++  run_log_file: /mnt/yulan/lvzhihao/PostTrain/outputs/logs/yulan_moe_math_dapo_full_cp8_20260914.log
++
++# Additional CLI arguments are appended by the launcher via "$@" and can
++# override parser defaults above. Environment overrides are documented inline
++# in the launcher (for example GLOBAL_BATCH_SIZE, NUM_ROLLOUT, OUTPUT_ROOT).
+diff --git a/.codex/yulan-math-rl-runner/SKILL.md b/.codex/yulan-math-rl-runner/SKILL.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..0ef9c0b89a135cf79bf45f8817512e1885398251
+--- /dev/null
++++ b/.codex/yulan-math-rl-runner/SKILL.md
+@@ -0,0 +1,163 @@
++---
++name: yulan-math-rl-runner
++description: Run, debug, and reproduce the YuLan MoE Math RL pipeline in slime, including HF/MCore loading, CP8/EP8 actor training, SGLang rollout lifecycle, routing replay, DAPO filtering, verifier/eval, and checkpoint retention.
++metadata:
++  short-description: Operate the YuLan MoE Math RL pipeline
++---
++
++# YuLan MoE Math RL runner
++
++Use this skill when a task concerns the YuLan MoE Math RL launch scripts, rollout/training consistency, SGLang/actor GPU orchestration, route replay, Math/DAPO rewards, or reproducing the stabilized pipeline in this repository.
++
++## Baseline and scope
++
++The stabilized branch was compared against `origin/main` at:
++
++```text
++origin/main: 4c193f1
++current commit: c08c2cf (stabilize Math RL rollout and replay diagnostics)
++```
++
++The main entrypoints are:
++
++- `scripts/run-yulan-moe-math-dapo-full.sh`: full 8-GPU launch wrapper, YuLan route-replay patch management, W&B/log/output defaults.
++- `scripts/run-yulan-moe-base-math-smoke.sh`: Ray submission and model/rollout argument assembly.
++- `scripts/models/yulan-moe-base.sh`: Qwen3-Next/YuLan hybrid MoE model definition.
++
++Preserve unrelated working-tree changes. Do not permanently edit YuLan-Pretrain for a slime experiment: use `patches/route_replay_yulan_pretrain.patch`; the full launcher applies it only when needed and reverses it on exit.
++
++## What differs from origin/main
++
++The relevant changes in `c08c2cf` are grouped as follows:
++
++1. **YuLan model and HF/MCore conversion**
++   - Adds `slime_plugins/models/yulan_moe.py` and the complete 56-layer hybrid GDN/MoE model configuration.
++   - Extends `slime/backends/megatron_utils/megatron_to_hf/qwen3_next.py` for YuLan GDN tensors and both ordinary-GQA and gated-attention QKV layouts.
++   - Passes `padding_mask` through the MCore forward path.
++
++2. **Routing replay and CP/actor initialization**
++   - Adds explicit actor-local `TopKRouter` replay-slot registration in `megatron_utils/actor.py`.
++   - Adds route replay and YuLan transformer/THD-CP environment propagation.
++   - Defers actor creation when `--destroy-rollout-engines` is active, and recreates actors after rollout engines are destroyed.
++
++3. **SGLang lifecycle and colocated memory safety**
++   - Adds `ServerGroup.destroy`, `RolloutServer.destroy_engines`, and `recreate_engines`.
++   - The intended lifecycle is: create HF-serving engines → rollout → save rollout → destroy engines → create/train actor → save MCore/HF → recreate engines with the new HF snapshot.
++   - With engine destruction, pass `--no-offload-train --no-offload-rollout`; do not simultaneously keep SGLang weights/KV cache and actor training weights on the same GPUs.
++   - Serving layout is four engines, each `TP=2, EP=2`, across eight rollout GPUs. Actor layout is `TP=1, PP=1, CP=8, EP=8`, with `--auto-generate-cu-seqlens` retained.
++
++4. **Math verifier and eval metrics**
++   - `math_dapo_utils.py` accepts `\\boxed`/`\\fbox`, broader final-answer forms, TeX canonicalization, math_verify variants, degree/radian variants, and prompt-aware multiple-choice labels.
++   - DAPO training rewards remain `+1/-1`; eval converts positive rewards to `0/1` accuracy.
++   - Eval reward dictionaries must use the configured reward key or the conventional `score` key.
++
++5. **Rollout data, filtering, and observability**
++   - Dataset loading supports directories of JSONL files.
++   - Prompt suffix/system prompt are applied before chat templating.
++   - Debug rollout saving is interval-controlled for training and always retained for eval.
++   - Dynamic filtering is group-level: `rollout_batch_size=32`, `n_samples_per_prompt=8` means 32 accepted prompt groups / 256 samples per rollout. `drop_*` counters are rejected candidate groups, not the final training size.
++
++6. **Checkpoint and W&B operations**
++   - Checkpoint retention keeps the newest two snapshots plus periodic snapshots every 20 steps.
++   - W&B random suffix generation is compatible with newer W&B versions.
++
++## Recommended full-run configuration
++
++Unless the user explicitly requests another layout, use the launcher defaults:
++
++```text
++HF checkpoint: /mnt/yulan/lvzhihao/PostTrain/models/YuLan-MoE-Base
++MCore reference: .../mcore-tp1pp1ep8-sqrtgate-hybrid0625-05
++actor: 8 GPUs, TP1/PP1/CP8/EP8
++rollout: 8 GPUs, four TP2/EP2 SGLang engines
++global batch: 256
++micro batch: 1
++rollout batch: 32 groups
++rollout N: 8
++rollout max response: 16384
++eval max response: 16384
++temperature: 0.7
++over-sampling batch: 48
++max tokens per GPU: 1024
++save interval: 20
++eval interval: 2
++debug rollout interval: 5
++advantage estimator: GRPO
++reward: DAPO
++route replay: enabled
++dynamic filter: check_reward_nonzero_std_with_fallback
++```
++
++The prompt suffix is:
++
++```text
++Please reason step by step, and put your final answer within \\boxed{}.
++```
++
++## Launch procedure
++
++Before launch:
++
++1. Check `git status`; do not erase user changes.
++2. Verify the HF config, MCore reference, merged judgeable JSONL, AIME 2024/2025 files, and route-replay patch exist.
++3. Verify the W&B key without printing it. A W&B HTTP 401 is an authentication failure, not a training failure; do not repeatedly restart the same invalid key.
++4. Use a new output/log directory for a fresh experiment. Do not mix a failed run's partial checkpoint with a new base run.
++5. Run `bash -n scripts/run-yulan-moe-math-dapo-full.sh` before submission.
++
++For a fresh run, submit the wrapper under `nohup`/`setsid` with secrets supplied only through the environment:
++
++```bash
++nohup setsid env \
++  WANDB_API_KEY="$WANDB_API_KEY" \
++  OUTPUT_ROOT=/mnt/yulan/lvzhihao/PostTrain/outputs/<run> \
++  RUN_LOG_FILE=/mnt/yulan/lvzhihao/PostTrain/outputs/logs/<run>.log \
++  SAVE_HF=/mnt/yulan/lvzhihao/PostTrain/outputs/<run>/hf/rollout_{rollout_id} \
++  ROLLOUT_NUM_GPUS=8 \
++  ROLLOUT_MAX_RESPONSE_LEN=16384 \
++  EVAL_MAX_RESPONSE_LEN=16384 \
++  OVER_SAMPLING_BATCH_SIZE=48 \
++  bash scripts/run-yulan-moe-math-dapo-full.sh \
++  > /mnt/yulan/lvzhihao/PostTrain/outputs/logs/<run>.launcher.log 2>&1 < /dev/null &
++```
++
++Immediately record the Ray submission ID from the launcher log and verify:
++
++```bash
++ray job status <submission-id>
++rg -n -- '--save-hf|--rollout-max-response-len|--eval-max-response-len|--over-sampling-batch-size|Rollout generation' <run>.log
++```
++
++Do not use an unquoted Bash default expression containing `{rollout_id}`. The safe launcher form is the explicit `if [[ -z ... ]]` initialization currently used in `run-yulan-moe-math-dapo-full.sh`; otherwise a supplied path can become `rollout_{rollout_id}}` and fail later in `str.format` during HF save.
++
++## Replay and no-engine debugging
++
++To reuse a saved training rollout, set:
++
++```text
++REPLAY_ROLLOUT_DATA=/path/debug/rollout_{rollout_id}.pt
++```
++
++The matching eval file should be `/path/debug/rollout_eval_0.pt`. For replay-only actor validation, make `ROLLOUT_NUM_GPUS=0`; the smoke wrapper then adds `--no-offload-train --no-offload-rollout` and does not need SGLang workers. Use a new output directory and set `NUM_ROLLOUT` to the number of replay files actually available.
++
++Do not assume `--load-forge-rollout-data` alone disables SGLang: the forge loader intentionally preserves the normal engine lifecycle unless rollout GPUs are explicitly set to zero.
++
++## Diagnosis checklist
++
++- **W&B `CommError` with HTTP 401:** invalid/revoked key; validate the credential and restart only after replacing it.
++- **`Single '}' encountered in format string`:** malformed `SAVE_HF`; inspect the submitted command and fix the launcher initialization, not the checkpoint converter.
++- **OOM at actor train:** verify SGLang engines were destroyed before actor creation; check for `--destroy-rollout-engines`, `--rebuild-train-actors`, and no simultaneous engine/actor residency.
++- **Large train/rollout logprob difference:** first confirm temperature conventions and route replay, then compare CP1 versus CP8. Do not infer an optimizer bug from this metric alone.
++- **Low DAPO effective signal:** `zero_std/count_*` describes accepted zero-variance groups; the final group count is still `rollout_batch_size`. With the fallback filter, zero-variance groups may be retained when needed to fill the batch.
++- **Very slow rollout:** inspect response truncation and max length first. At length 16384, oversampling 48 and four TP2/EP2 engines are expected to be much slower than a short smoke run.
++
++## Validation
++
++Run the targeted checks after code changes:
++
++```bash
++bash -n scripts/run-yulan-moe-base-math-smoke.sh
++bash -n scripts/run-yulan-moe-math-dapo-full.sh
++pytest -q tests/test_rm_math.py tests/test_rm_math_dapo.py tests/test_hf_to_megatron.py tests/test_checkpoint_retention.py
++```
++
++For a launch change, validate the actual Ray entrypoint in the log; shell syntax alone is insufficient.
+diff --git a/.rayignore b/.rayignore
+new file mode 100644
+index 0000000000000000000000000000000000000000..f2bccdb75e99a8999a3690a6cd1e6c2eec9a876a
+--- /dev/null
++++ b/.rayignore
+@@ -0,0 +1,23 @@
++# Local Python environment is used by the submitting host, not uploaded.
++.venv/
++
++# Runtime outputs and caches are not source dependencies.
++outputs/
++__pycache__/
++.pytest_cache/
++.rayignore
++
++# Large local datasets and generated rollout artifacts are available locally
++# and must not be included in the Ray Jobs working-directory package.
++yongxiang/data/*
++!yongxiang/data/apps_eval_100_seed42.jsonl
++*.pt
++*.log
++*.tar
++*.tar.gz
++
++# Repository metadata and editor/build caches.
++.git/
++.mypy_cache/
++.ruff_cache/
++*.so
+diff --git a/.ai/aime24_eval.yaml b/configs/eval/aime24_eval.yaml
+similarity index 100%
+rename from .ai/aime24_eval.yaml
+rename to configs/eval/aime24_eval.yaml
+diff --git a/.ai/hybrid_optimizer_leaf.patch b/patches/hybrid_optimizer_leaf.patch
+similarity index 100%
+rename from .ai/hybrid_optimizer_leaf.patch
+rename to patches/hybrid_optimizer_leaf.patch
+diff --git a/patches/route_replay_yulan_pretrain.patch b/patches/route_replay_yulan_pretrain.patch
+new file mode 100644
+index 0000000000000000000000000000000000000000..94a8282fbdf81984989107eb77221ad9df8ca973
+--- /dev/null
++++ b/patches/route_replay_yulan_pretrain.patch
+@@ -0,0 +1,26 @@
++diff --git a/megatron/core/transformer/moe/moe_utils.py b/megatron/core/transformer/moe/moe_utils.py
++--- a/megatron/core/transformer/moe/moe_utils.py
+++++ b/megatron/core/transformer/moe/moe_utils.py
++@@ -803,6 +803,9 @@ def topk_routing_with_score_function(
++         else:
++             return torch.topk(scores, k=topk, dim=1)
++ 
+++    from slime.utils.routing_replay import get_routing_replay_compute_topk
+++
+++    compute_topk = get_routing_replay_compute_topk(compute_topk)
++     if score_function == "softmax":
++         if use_pre_softmax:
++             scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
++diff --git a/megatron/core/transformer/moe/router.py b/megatron/core/transformer/moe/router.py
++--- a/megatron/core/transformer/moe/router.py
+++++ b/megatron/core/transformer/moe/router.py
++@@ -337,6 +337,9 @@ class TopKRouter(Router):
++             pg_collection (ProcessGroupCollection, optional): Process groups for MoE operations.
++         """
++         super().__init__(config=config, pg_collection=pg_collection)
+++        from slime.utils.routing_replay import register_routing_replay
+++
+++        register_routing_replay(self)
++         self.topk = self.config.moe_router_topk
++         self.routing_type = self.config.moe_router_load_balancing_type
++         self.score_function = self.config.moe_router_score_function
+diff --git a/.ai/routing_replay_megatron.patch b/patches/routing_replay_megatron.patch
+similarity index 100%
+rename from .ai/routing_replay_megatron.patch
+rename to patches/routing_replay_megatron.patch
+diff --git a/.ai/sglang_routing_replay.patch b/patches/sglang_routing_replay.patch
+similarity index 100%
+rename from .ai/sglang_routing_replay.patch
+rename to patches/sglang_routing_replay.patch
+diff --git a/.ai/transformer_engine_fused_adam_chunked.patch b/patches/transformer_engine_fused_adam_chunked.patch
+similarity index 100%
+rename from .ai/transformer_engine_fused_adam_chunked.patch
+rename to patches/transformer_engine_fused_adam_chunked.patch
+diff --git a/scripts/run-yulan-moe-base-math-smoke.sh b/scripts/run-yulan-moe-base-math-smoke.sh
+index ef9328f17198cee230b80bfee665afa110f12cbd..331cf3abf0ba9c5223506fd172e12891a304ca91 100755
+--- a/scripts/run-yulan-moe-base-math-smoke.sh
++++ b/scripts/run-yulan-moe-base-math-smoke.sh
+@@ -39,7 +39,7 @@ CKPT_ARGS=(
+    --model-name qwen3_next
+    --ref-load "${MCORE_CHECKPOINT}"
+    --save "${OUTPUT_ROOT}"
+-   --save-interval 1
++   --save-interval "${SAVE_INTERVAL:-1}"
+    --checkpoint-retention-count 2
+    --checkpoint-retention-interval 20
+    --no-save-optim
+@@ -106,18 +106,20 @@ PARALLEL_ARGS=(
+    --context-parallel-size 8
+    --expert-model-parallel-size 8
+    --expert-tensor-parallel-size 1
+-   --use-dynamic-batch-size
+-   --max-tokens-per-gpu 1536
++   --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU:-1536}"
+    --recompute-granularity full
+    --recompute-method uniform
+    --recompute-num-layers 1
+ )
++if [[ "${USE_DYNAMIC_BATCH_SIZE:-1}" == "1" ]]; then
++   PARALLEL_ARGS+=(--use-dynamic-batch-size)
++fi
+ 
+ ALGORITHM_ARGS=(
+    --advantage-estimator grpo
+    --kl-coef 0
+    --kl-loss-coef 0
+-   --entropy-coef 0
++   --entropy-coef "${ENTROPY_COEF:-0}"
+    --eps-clip 0.2
+    --eps-clip-high 0.28
+ )
+@@ -147,6 +149,7 @@ SGLANG_ARGS=(
+    # two-GPU engines on the eight rollout GPUs instead of running an
+    # unvalidated TP8/EP8 engine, which produces corrupted trajectories here.
+    --rollout-num-gpus-per-engine 2
++   --sglang-tensor-parallel-size 2
+    --sglang-ep-size 2
+    --sglang-dtype bfloat16
+    # The released HF config omits this YuLan checkpoint semantic.  Keep the
+@@ -210,6 +213,10 @@ if [[ "${COLOCATE:-0}" == "1" ]]; then
+       # Replay-only validation has no SGLang workers. Avoid initializing the
+       # TorchMemorySaver offload path in this mode.
+       TRAIN_LAYOUT_ARGS+=(--no-offload-train --no-offload-rollout)
++   elif [[ "${DESTROY_ROLLOUT_ENGINES:-0}" == "1" ]]; then
++      # Engines are destroyed before actor_train and recreated after saving;
++      # no TorchMemorySaver offload is needed in this lifecycle.
++      TRAIN_LAYOUT_ARGS+=(--no-offload-train --no-offload-rollout)
+    else
+       if [[ "${REBUILD_TRAIN_ACTORS:-0}" == "1" ]]; then
+          TRAIN_LAYOUT_ARGS+=(--no-offload-train --no-offload-rollout)
+@@ -221,11 +228,10 @@ if [[ "${COLOCATE:-0}" == "1" ]]; then
+    fi
+ fi
+ 
+-# Ray jobs do not automatically inherit submitter-side credentials.  Pass the
+-# W&B credential through the runtime environment without putting it in the
+-# command line or repository files.  Disable xtrace while expanding the secret.
++# Keep W&B credentials in the Ray worker user's ~/.netrc. Do not put the key in
++# Ray runtime_env: Ray exposes runtime environment variables in job metadata.
+ set +x
+-RUNTIME_ENV_JSON="{\"env_vars\":{\"WANDB_API_KEY\":\"${WANDB_API_KEY:-}\"}}"
++RUNTIME_ENV_JSON="$("${SLIME_ROOT}/.venv/bin/python" -c 'import json, os; keys = ("SLIME_USE_YULAN_THD_CP", "SLIME_USE_YULAN_TRANSFORMER_BLOCK", "PYTHONPATH", "PATH", "LD_LIBRARY_PATH", "SGLANG_EXTERNAL_MODEL_PACKAGE", "MOE_ROUTER_SQRT_GATE", "CUDA_HOME", "CUDA_DEVICE_MAX_CONNECTIONS", "TORCH_CUDA_ARCH_LIST", "TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "MASTER_ADDR"); print(json.dumps({"env_vars": {key: os.environ[key] for key in keys if key in os.environ}}))')"
+ 
+ # Keep xtrace disabled through submission: Ray's command echo would otherwise
+ # print the W&B credential embedded in runtime_env_json.
+diff --git a/scripts/run-yulan-moe-math-dapo-full.sh b/scripts/run-yulan-moe-math-dapo-full.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..a0fd08524bc286528ac359fdf54dc14f79ac9ac4
+--- /dev/null
++++ b/scripts/run-yulan-moe-math-dapo-full.sh
+@@ -0,0 +1,108 @@
++#!/usr/bin/env bash
++
++set -euo pipefail
++
++SLIME_ROOT=/mnt/yulan/lvzhihao/PostTrain/slime
++POSTTRAIN_ROOT=/mnt/yulan/lvzhihao/PostTrain
++YULAN_ROOT=${POSTTRAIN_ROOT}/YuLan-Pretrain
++ROUTE_REPLAY_PATCH=${SLIME_ROOT}/patches/route_replay_yulan_pretrain.patch
++ROUTE_REPLAY_TARGETS=(
++   megatron/core/transformer/moe/moe_utils.py
++   megatron/core/transformer/moe/router.py
++)
++
++if ! awk '
++   { for (i = 1; i <= NF; i++) {
++      if ($i == "machine") { active = ($(i + 1) == "api.wandb.ai"); i++; continue }
++      if (active && $i == "password" && $(i + 1) != "") found = 1
++   } }
++   END { exit !found }
++' "$HOME/.netrc" 2>/dev/null; then
++   echo "A W&B API key must be configured in this user's ~/.netrc before starting full training." >&2
++   exit 2
++fi
++
++for required_path in \
++   "${SLIME_ROOT}/.venv/bin/python" \
++   "${YULAN_ROOT}/.git" \
++   "${ROUTE_REPLAY_PATCH}" \
++   "${POSTTRAIN_ROOT}/models/YuLan-MoE-Base/config.json" \
++   "${POSTTRAIN_ROOT}/models/YuLan-MoE-Base/mcore-tp1pp1ep8-sqrtgate-hybrid0625-05/latest_checkpointed_iteration.txt" \
++   "${POSTTRAIN_ROOT}/data/hf_data/math_rl_mid_high_20k_20260924/rollout_20k.jsonl" \
++   "${POSTTRAIN_ROOT}/data/aime-2024.jsonl" \
++   "${POSTTRAIN_ROOT}/data/aime-2025.jsonl"; do
++   if [[ ! -e "${required_path}" ]]; then
++      echo "Required path does not exist: ${required_path}" >&2
++      exit 2
++   fi
++done
++
++patch_applied_by_launcher=0
++if git -C "${YULAN_ROOT}" apply --reverse --check "${ROUTE_REPLAY_PATCH}" >/dev/null 2>&1; then
++   echo "YuLan route-replay patch is already applied; leaving it applied after launch."
++elif git -C "${YULAN_ROOT}" diff --quiet -- "${ROUTE_REPLAY_TARGETS[@]}"; then
++   git -C "${YULAN_ROOT}" apply "${ROUTE_REPLAY_PATCH}"
++   patch_applied_by_launcher=1
++else
++   echo "YuLan route-replay targets have unrelated local changes; refusing to overwrite them." >&2
++   git -C "${YULAN_ROOT}" status --short -- "${ROUTE_REPLAY_TARGETS[@]}" >&2
++   exit 2
++fi
++
++restore_route_replay_patch() {
++   if [[ "${patch_applied_by_launcher}" == "1" ]]; then
++      git -C "${YULAN_ROOT}" apply --reverse "${ROUTE_REPLAY_PATCH}"
++      echo "Restored YuLan route-replay target files; patch remains at ${ROUTE_REPLAY_PATCH}."
++   fi
++}
++trap restore_route_replay_patch EXIT
++
++export SLIME_USE_YULAN_THD_CP=1
++export SLIME_USE_YULAN_TRANSFORMER_BLOCK=1
++export AUTO_GENERATE_CU_SEQLENS=1
++export DESTROY_ROLLOUT_ENGINES=1
++export REBUILD_TRAIN_ACTORS=1
++export COLOCATE=1
++export ROLLOUT_NUM_GPUS=${ROLLOUT_NUM_GPUS:-8}
++export PROMPT_DATA=${PROMPT_DATA:-${POSTTRAIN_ROOT}/data/hf_data/AIME_like_data_judgeable/aime_like_judgeable.jsonl}
++export OUTPUT_ROOT=${OUTPUT_ROOT:-${POSTTRAIN_ROOT}/outputs/yulan_moe_math_dapo_full_cp8_20260914}
++if [[ -z "${SAVE_HF:-}" ]]; then
++   SAVE_HF="${OUTPUT_ROOT}/hf/rollout_{rollout_id}"
++fi
++export SAVE_HF
++export RUN_LOG_FILE=${RUN_LOG_FILE:-${POSTTRAIN_ROOT}/outputs/logs/yulan_moe_math_dapo_full_cp8_20260914.log}
++export SAVE_INTERVAL=20
++export MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU:-1024}
++export ROLLOUT_MAX_RESPONSE_LEN=${ROLLOUT_MAX_RESPONSE_LEN:-16384}
++export ROLLOUT_MAX_CONTEXT_LEN=32768
++export ROLLOUT_TEMPERATURE=${ROLLOUT_TEMPERATURE:-0.7}
++export ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-32}
++export N_SAMPLES_PER_PROMPT=8
++export GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-256}
++export OVER_SAMPLING_BATCH_SIZE=${OVER_SAMPLING_BATCH_SIZE:-32}
++export NUM_ROLLOUT=${NUM_ROLLOUT:-446}
++
++mkdir -p "$(dirname "${RUN_LOG_FILE}")"
++
++"${SLIME_ROOT}/scripts/run-yulan-moe-base-math-smoke.sh" \
++   --micro-batch-size 1 \
++   --use-routing-replay \
++   --over-sampling-batch-size "${OVER_SAMPLING_BATCH_SIZE}" \
++   --save-debug-rollout-data "${OUTPUT_ROOT}/debug/rollout_{rollout_id}.pt" \
++   --save-debug-rollout-interval 5 \
++   --eval-interval 2 \
++   --eval-prompt-data aime2024 "${POSTTRAIN_ROOT}/data/aime-2024.jsonl" aime2025 "${POSTTRAIN_ROOT}/data/aime-2025.jsonl" \
++   --eval-input-key prompt \
++   --eval-label-key label \
++   --n-samples-per-eval-prompt 2 \
++   --eval-temperature "${EVAL_TEMPERATURE:-${ROLLOUT_TEMPERATURE}}" \
++   --eval-max-prompt-len 1024 \
++   --eval-max-response-len "${EVAL_MAX_RESPONSE_LEN:-16384}" \
++   --eval-max-context-len 32768 \
++   --use-wandb \
++   --wandb-mode online \
++   --wandb-project yulan-moe-math-rl \
++   --wandb-group yulan-moe-dapo-full-cp8 \
++   --disable-wandb-random-suffix \
++   --wandb-dir "${POSTTRAIN_ROOT}/outputs/wandb" \
++   "$@"
+diff --git a/slime/backends/megatron_utils/actor.py b/slime/backends/megatron_utils/actor.py
+index 9a5fe5e5522b5dfea1ce30cadd027100a01891e5..cf476b8881f1eab6b1b0f5e953ef408324766bd1 100644
+--- a/slime/backends/megatron_utils/actor.py
++++ b/slime/backends/megatron_utils/actor.py
+@@ -99,6 +99,29 @@ class MegatronTrainRayActor(TrainRayActor):
+             args, role
+         )
+ 
++        if args.use_routing_replay and role == "actor":
++            # The YuLan router patch normally registers these during router
++            # construction.  When the model is built through the TransformerBlock
++            # adapter, however, construction can happen before the actor-local
++            # replay environment is visible.  Attach the replay slots explicitly
++            # after the model is fully built, before any rollout is trained.
++            from slime.utils.routing_replay import register_routing_replay
++
++            router_count = 0
++            for model_chunk in self.model:
++                for module in model_chunk.modules():
++                    if module.__class__.__name__ != "TopKRouter":
++                        continue
++                    if not hasattr(module, "routing_replay"):
++                        register_routing_replay(module)
++                    if hasattr(module, "routing_replay"):
++                        router_count += 1
++            logger.info(
++                "Routing replay initialized for %d local TopKRouter modules (%d replay slots)",
++                router_count,
++                len(RoutingReplay.all_routing_replays),
++            )
++
+         vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1
+         if vpp_size > 1:
+             from megatron.core.utils import get_model_config
+diff --git a/slime/backends/megatron_utils/cp_utils.py b/slime/backends/megatron_utils/cp_utils.py
+index a54da3a7ef688e5b52266ab6f54bafd9127045c1..9e11a29eed0d5dcdcf9418494752a65826e527ac 100644
+--- a/slime/backends/megatron_utils/cp_utils.py
++++ b/slime/backends/megatron_utils/cp_utils.py
+@@ -1,3 +1,4 @@
++import os
+ from collections.abc import Callable, Sequence
+ 
+ import torch
+@@ -266,6 +267,22 @@ def prepare_routed_experts_for_routing_replay(
+         assert experts.shape[0] == token_ids.shape[0] - 1, f"{experts.shape}, {token_ids.shape}"
+ 
+     padded_experts = [_pad_routed_experts(experts, 1, num_experts) for experts in rollout_routed_experts]
++
++    if os.environ.get("SLIME_USE_YULAN_THD_CP") == "1" and not allgather_cp:
++        # YuLan's packed THD input pads every sample before applying TE's
++        # interleaved CP partition. Routing replay must use the same physical
++        # layout; the router receives the padding mask separately and keeps
++        # these rows in its static dispatch shape.
++        cp_size = mpu.get_context_parallel_world_size()
++        alignment = 2 * cp_size
++        local_experts = []
++        for experts, token_ids in zip(padded_experts, tokens, strict=True):
++            token_length = token_ids.size(0)
++            padded_length = ((token_length + alignment - 1) // alignment) * alignment
++            experts = _pad_routed_experts(experts, padded_length - token_length, num_experts)
++            local_experts.append(slice_with_cp(experts, 0))
++        return torch.cat(local_experts, dim=0)
++
+     pad_size = mpu.get_tensor_model_parallel_world_size() * data_pad_size_multiplier
+ 
+     if allgather_cp:
+diff --git a/slime/backends/megatron_utils/data.py b/slime/backends/megatron_utils/data.py
+index 6ae48a9613fef893461b20fb38db3de769141d22..1fc6e2c60caa560f70bccd4d020b62332846d8eb 100644
+--- a/slime/backends/megatron_utils/data.py
++++ b/slime/backends/megatron_utils/data.py
+@@ -1,9 +1,11 @@
++import os
+ from collections.abc import Sequence
+ 
+ import torch
+ import torch.nn.functional as F
+ from megatron.core import mpu
+ from megatron.core.packed_seq_params import PackedSeqParams
++from megatron.core.utils import get_thd_batch_on_this_cp_rank
+ 
+ from slime.utils import accelerator
+ from slime.utils.types import RolloutBatch
+@@ -52,6 +54,85 @@ def get_batch(
+     cp_size = mpu.get_context_parallel_world_size()
+     cp_rank = mpu.get_context_parallel_rank()
+ 
++    # YuLan-Pretrain's packed THD path is the reference implementation for
++    # CP with per-sample padding.  Keep the old path available for A/B tests,
++    # but allow the actor to use the exact same partition helper without
++    # changing YuLan-Pretrain itself.
++    use_yulan_thd_cp = cp_size > 1 and os.environ.get("SLIME_USE_YULAN_THD_CP") == "1"
++    if use_yulan_thd_cp and allgather_cp:
++        raise ValueError("SLIME_USE_YULAN_THD_CP is incompatible with allgather_cp")
++
++    if use_yulan_thd_cp:
++        padded_tokens = []
++        padded_loss_masks = []
++        sequence_lengths = []
++        padded_sequence_lengths = []
++        alignment = 2 * cp_size
++        for token, loss_mask, total_length, response_length in zip(
++            tokens,
++            batch["loss_masks"],
++            batch["total_lengths"],
++            batch["response_lengths"],
++            strict=True,
++        ):
++            total_length = int(total_length)
++            response_length = int(response_length)
++            sequence_lengths.append(total_length)
++            padded_length = ((total_length + alignment - 1) // alignment) * alignment
++            padded_sequence_lengths.append(padded_length)
++            padding = padded_length - total_length
++            padded_tokens.append(F.pad(token, (0, padding), value=pad_token_id))
++            sample_loss_mask = F.pad(loss_mask, (total_length - response_length - 1, 1), value=0)
++            padded_loss_masks.append(F.pad(sample_loss_mask, (0, padding), value=0))
++
++        packed_total_tokens = sum(padded_sequence_lengths)
++        logical_total_tokens = sum(sequence_lengths)
++        # There is no source-side padding in rollout samples; the only
++        # invalid positions are the per-sample CP alignment tokens.
++        valid_total_tokens = logical_total_tokens
++        cu_seqlens = torch.zeros(
++            len(padded_sequence_lengths) + 1,
++            dtype=torch.int32,
++            device=accelerator.current_device(),
++        )
++        cu_seqlens[1:] = torch.cumsum(
++            torch.tensor(padded_sequence_lengths, dtype=torch.int32, device=cu_seqlens.device),
++            dim=0,
++        )
++        # YuLan's packed collator intentionally passes padded boundaries to
++        # both TE fields because TE cannot represent gaps between samples.
++        cu_seqlens_padded = cu_seqlens.clone()
++        global_batch = {
++            "tokens": torch.cat(padded_tokens, dim=0).unsqueeze(0),
++            "full_loss_masks": torch.cat(padded_loss_masks, dim=0).unsqueeze(0),
++            "padding_mask": torch.cat(
++                [
++                    F.pad(
++                        torch.zeros(length, dtype=torch.bool, device=token.device),
++                        (0, padded_length - length),
++                        value=True,
++                    )
++                    for length, padded_length, token in zip(
++                        sequence_lengths, padded_sequence_lengths, tokens, strict=True
++                    )
++                ],
++                dim=0,
++            ).unsqueeze(0),
++        }
++        global_batch, packed_seq_params = get_thd_batch_on_this_cp_rank(
++            global_batch,
++            cu_seqlens,
++            cu_seqlens_padded,
++            max(padded_sequence_lengths),
++            logical_total_tokens=logical_total_tokens,
++            valid_total_tokens=valid_total_tokens,
++            packed_total_tokens=packed_total_tokens,
++        )
++        batch["tokens"] = global_batch["tokens"]
++        batch["full_loss_masks"] = global_batch["full_loss_masks"]
++        batch["packed_seq_params"] = packed_seq_params
++        return batch
++
+     if allgather_cp:
+         # DSA mode: concatenate all sequences first, then slice once with CP.
+         # We also pad the *global* concatenated stream to make per-rank chunks equal.
+diff --git a/slime/backends/megatron_utils/model.py b/slime/backends/megatron_utils/model.py
+index 418294e192bf5fd23d7bc5ac52d43cd5e5c939f8..d3712b2275a90509d38dd1cbdf05d5e861fcfe42 100644
+--- a/slime/backends/megatron_utils/model.py
++++ b/slime/backends/megatron_utils/model.py
+@@ -620,6 +620,7 @@ def train_one_step(
+                 labels=None,
+                 packed_seq_params=batch["packed_seq_params"],
+                 loss_mask=batch["full_loss_masks"],
++                padding_mask=batch.get("padding_mask"),
+             )
+         else:
+             forward_kwargs = {
+@@ -629,6 +630,7 @@ def train_one_step(
+                 "labels": None,
+                 "packed_seq_params": batch["packed_seq_params"],
+                 "loss_mask": batch["full_loss_masks"],
++                "padding_mask": batch.get("padding_mask"),
+             }
+ 
+             if batch["multimodal_train_inputs"] is not None:
+diff --git a/slime/backends/sglang_utils/deployment.py b/slime/backends/sglang_utils/deployment.py
+index ce66795dc31bd3475217ced7b8bbc20a85a1f1d0..9a90b384745399e4f8e2e3ad6bdc3c9fe2a18b7e 100644
+--- a/slime/backends/sglang_utils/deployment.py
++++ b/slime/backends/sglang_utils/deployment.py
+@@ -37,6 +37,7 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool
+     router_args.port = router_port
+     router_args.prometheus_port = find_available_port(random.randint(4000, 5000))
+     router_args.request_timeout_secs = args.sglang_router_request_timeout_secs
++    router_args.request_id_headers = ["x-request-id"]
+ 
+     if has_pd_disaggregation:
+         router_args.pd_disaggregation = True
+diff --git a/slime/ray/actor_group.py b/slime/ray/actor_group.py
+index 02ccff6b1af0d131cfa149d19f02f7b900c1d0bf..a636a320bb21dc51cec93ccdc8118177df6a55b2 100644
+--- a/slime/ray/actor_group.py
++++ b/slime/ray/actor_group.py
+@@ -96,7 +96,6 @@ class RayTrainGroup:
+         # We cannot do routing replay for critic.
+         if self.args.use_routing_replay and self.role == "actor":
+             env_vars["ENABLE_ROUTING_REPLAY"] = "1"
+-
+         if self._actor_cls is None:
+             from slime.backends.megatron_utils.actor import MegatronTrainRayActor
+ 
+diff --git a/slime/ray/placement_group.py b/slime/ray/placement_group.py
+index 1c905c918a67046c3e19b6c3ad6fa6285b624fea..15d31752cd30b52c0922b447dd0c0f19214cae93 100644
+--- a/slime/ray/placement_group.py
++++ b/slime/ray/placement_group.py
+@@ -183,7 +183,7 @@ def create_actor_model(args, pgs, rollout_manager, actor_cls=None):
+     # the training actor is absent from GPU memory.  Allocate the Ray group
+     # now, but defer actor.init() until train.py has destroyed the rollout
+     # engines after the first rollout.
+-    if args.rebuild_train_actors:
++    if args.rebuild_train_actors or args.destroy_rollout_engines:
+         actor_start_rollout_ids = [args.start_rollout_id or 0]
+     else:
+         actor_start_rollout_ids = actor_model.create(rollout_manager=rollout_manager)
+diff --git a/slime/rollout/rm_hub/__init__.py b/slime/rollout/rm_hub/__init__.py
+index a2739fbec763ad28cead5b205c27f50bf14a5d07..88fbdfa795efaaf32f8ed87d2309e63f410c692f 100644
+--- a/slime/rollout/rm_hub/__init__.py
++++ b/slime/rollout/rm_hub/__init__.py
+@@ -9,6 +9,7 @@ logger = logging.getLogger(__name__)
+ from slime.utils.misc import load_function
+ from slime.utils.types import Sample
+ 
++from .code_utils import compute_score as compute_score_code
+ from .deepscaler import get_deepscaler_rule_based_reward
+ from .f1 import f1_score
+ from .gpqa import compute_gpqa_reward
+@@ -77,7 +78,9 @@ async def async_rm(args, sample: Sample, **kwargs):
+     elif rm_type == "deepscaler":
+         return get_deepscaler_rule_based_reward(response, label)
+     elif rm_type == "dapo":
+-        return compute_score_dapo(response, label)
++        return compute_score_dapo(response, label, prompt=sample.prompt)
++    elif rm_type == "code":
++        return compute_score_code(response, label, prompt=sample.prompt)
+     elif rm_type == "math":
+         return 1 if grade_answer_verl(response, label) else 0
+     elif rm_type == "f1":
+@@ -101,6 +104,11 @@ async def batched_async_rm(
+     samples: list[Sample],
+     **kwargs,
+ ) -> list[int | float]:
++    # Evaluation datasets may provide a per-sample reward function. Preserve
++    # that override in batched rollouts instead of silently routing samples to
++    # the global --custom-rm-path implementation.
++    if any(sample.custom_rm_path for sample in samples):
++        return await asyncio.gather(*(async_rm(args, sample, **kwargs) for sample in samples))
+     if args.custom_rm_path is not None:
+         # Ensure the custom reward function is implemented in batch mode
+         rm_function = load_function(args.custom_rm_path)
+diff --git a/slime/rollout/rm_hub/code_utils.py b/slime/rollout/rm_hub/code_utils.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3d31b4031451e56384513d7939b242f39196e18d
+--- /dev/null
++++ b/slime/rollout/rm_hub/code_utils.py
+@@ -0,0 +1,101 @@
++import json
++import os
++import re
++import subprocess
++import sys
++import tempfile
++
++
++def _strip_reasoning_markers(response: str) -> str:
++    """Remove reasoning wrappers and generation end markers from a response."""
++    response = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL | re.IGNORECASE)
++    if "</think>" in response:
++        # Chat templates may put the opening <think> marker in the prompt, so
++        # the generated response can contain only the closing marker.
++        response = response.split("</think>", 1)[1]
++    for marker in ("<|im_end|>", "<|endoftext|>"):
++        if marker in response:
++            response = response.split(marker, 1)[0]
++    return response
++
++
++def _extract_code(response: str, entry_point: str | None = None) -> str:
++    if not isinstance(response, str):
++        return ""
++
++    response = _strip_reasoning_markers(response)
++
++    # Match fences that occupy their own lines. This avoids treating prose such
++    # as "in a ```python code block" as an opening fence.
++    blocks = re.findall(
++        r"(?ms)^[ \t]*```(?:python|py)?[ \t]*\r?\n(.*?)^[ \t]*```[ \t]*(?:\r?\n|$)",
++        response,
++    )
++    if blocks:
++        if entry_point:
++            function_pattern = rf"(?m)^\s*(?:async\s+)?def\s+{re.escape(entry_point)}\s*\("
++            matching_blocks = [block for block in blocks if re.search(function_pattern, block)]
++            if matching_blocks:
++                return matching_blocks[-1].strip()
++        return blocks[-1].strip()
++
++    # Some responses omit fences but still include the requested function.
++    # Drop the explanation before the entry-point definition when possible.
++    if entry_point:
++        entry_match = re.search(
++            rf"(?m)^\s*(?:async\s+)?def\s+{re.escape(entry_point)}\s*\(", response
++        )
++        if entry_match:
++            return response[entry_match.start() :].strip()
++        # A response that never defines the requested function is reasoning or
++        # other prose, not executable candidate code. Returning it here makes
++        # reward logs misleading and can accidentally execute arbitrary text.
++        return ""
++    return response.strip()
++
++
++def _run_test(code: str, entry_point: str, test_code: str, timeout: int = 5) -> bool:
++    # This executes model-generated Python directly. Production deployments should
++    # run it in an isolated, resource-limited, non-root sandbox without network access.
++    program = code + "\n\n" + test_code
++    # HumanEval-style tests expose check(candidate), while MBPP-style tests
++    # execute their own input/assertion loop and must not receive a synthetic
++    # check() call.
++    if re.search(r"(?m)^\s*(?:async\s+)?def\s+check\s*\(", test_code):
++        program += f"\n\ncheck({entry_point})\n"
++    with tempfile.TemporaryDirectory() as directory:
++        path = os.path.join(directory, "solution.py")
++        with open(path, "w", encoding="utf-8") as file:
++            file.write(program)
++        process = subprocess.run(
++            [sys.executable, path],
++            capture_output=True,
++            text=True,
++            timeout=timeout,
++        )
++        return process.returncode == 0
++
++
++def compute_score(solution_str, ground_truth, prompt=None, **kwargs) -> dict:
++    del prompt, kwargs
++    try:
++        metadata = json.loads(ground_truth) if isinstance(ground_truth, str) else ground_truth
++        entry_point = metadata["entry_point"]
++        test_code = metadata["test"]
++        if not isinstance(entry_point, str) or not isinstance(test_code, str):
++            raise TypeError("entry_point and test must be strings")
++    except Exception:
++        return {"score": -1.0, "acc": False, "pred": "[BAD_LABEL]"}
++
++    try:
++        code = _extract_code(solution_str, entry_point)
++        passed = _run_test(code, entry_point, test_code)
++    except Exception:
++        code = solution_str if isinstance(solution_str, str) else repr(solution_str)
++        passed = False
++
++    return {
++        "score": 1.0 if passed else -1.0,
++        "acc": bool(passed),
++        "pred": code[:200],
++    }
+diff --git a/slime/rollout/rm_hub/math_dapo_utils.py b/slime/rollout/rm_hub/math_dapo_utils.py
+index a885cc1b29118ab6a594d419e2fd1715a32005e7..5e1d4a967e6eef0fed30ce5f3a22f7f9ccce3dd0 100644
+--- a/slime/rollout/rm_hub/math_dapo_utils.py
++++ b/slime/rollout/rm_hub/math_dapo_utils.py
+@@ -33,7 +33,10 @@ def last_boxed_only_string(string: str) -> str | None:
+     Returns:
+         The last boxed expression or None if not found
+     """
+-    idx = string.rfind("\\boxed{")
++    # OpenCompass accepts both forms; some generated/reference solutions use
++    # ``\\fbox`` instead of ``\\boxed``.
++    boxed_markers = ("\\boxed{", "\\fbox{")
++    idx = max((string.rfind(marker) for marker in boxed_markers), default=-1)
+     if idx < 0:
+         return None
+ 
+@@ -63,8 +66,8 @@ def remove_boxed(s: str) -> str:
+     Returns:
+         The content inside the boxed command
+     """
+-    left = "\\boxed{"
+-    assert s[: len(left)] == left, f"box error: {s}"
++    left = "\\boxed{" if s.startswith("\\boxed{") else "\\fbox{"
++    assert s.startswith(left), f"box error: {s}"
+     assert s[-1] == "}", f"box error: {s}"
+     return s[len(left) : -1]
+ 
+@@ -159,6 +162,12 @@ def normalize_final_answer(final_answer: str) -> str:
+     final_answer = str(final_answer)
+     final_answer = final_answer.split("=")[-1]
+ 
++    # Match the low-cost TeX canonicalization used by OpenCompass before the
++    # semantic math verifier.  This also makes the fallback string matcher
++    # robust when math_verify cannot parse a malformed-but-obvious fragment.
++    final_answer = final_answer.replace("\\dfrac", "\\frac").replace("\\tfrac", "\\frac")
++    final_answer = final_answer.replace("\\left", "").replace("\\right", "")
++
+     # Apply substitutions and removals
+     for before, after in SUBSTITUTIONS:
+         final_answer = final_answer.replace(before, after)
+@@ -190,7 +199,10 @@ def normalize_final_answer(final_answer: str) -> str:
+ 
+ 
+ def is_correct_minerva(
+-    solution_str: str, gt: str, gt_need_extract: bool = False, answer_pattern: str = r"(?i)Answer\s*:\s*([^\n]+)"
++    solution_str: str,
++    gt: str,
++    gt_need_extract: bool = False,
++    answer_pattern: str = r"(?i)(?:final\s+answer|answer)\s*(?:is\s*)?:?\s*([^\n]+)",
+ ) -> tuple[bool, str]:
+     """Check if the solution is correct according to Minerva criteria.
+ 
+@@ -275,6 +287,19 @@ def _math_verify_variants(text: str) -> list[str]:
+     """
+     text = str(text).strip()
+     variants = [text]
++
++    # ``math_verify`` does not assign the same meaning to a degree-marked
++    # number and a radian expression.  Contest data mixes e.g. ``60^\circ``
++    # and ``\pi/3``; add a mathematically equivalent radian form while
++    # retaining the original text for non-angle answers.
++    degree_match = re.fullmatch(
++        r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*(?:\^\s*\\circ|\^\s*\{\\circ\}|°)\s*",
++        text,
++    )
++    if degree_match:
++        number = degree_match.group(1)
++        radian = rf"\frac{{{number}\pi}}{{180}}"
++        variants.extend([radian, f"${radian}$", rf"\boxed{{{radian}}}"])
+     has_delimiter = any(token in text for token in ("$", r"\(", r"\[", r"\boxed{"))
+     looks_like_math = bool(
+         re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", text)
+@@ -286,7 +311,11 @@ def _math_verify_variants(text: str) -> list[str]:
+ 
+ 
+ def verify(
+-    solution_str: str, answer: str, strict_box_verify: bool = False, pause_tokens_index: list[int] | None = None
++    solution_str: str,
++    answer: str,
++    strict_box_verify: bool = False,
++    pause_tokens_index: list[int] | None = None,
++    prompt: str | None = None,
+ ) -> bool:
+     """Verify if the solution is correct.
+ 
+@@ -303,6 +332,31 @@ def verify(
+         correct, pred = is_correct_strict_box(solution_str, answer, pause_tokens_index)
+         return correct == 1, pred
+ 
++    # Multiple-choice sources in the merged corpus use both conventions:
++    # some labels are the 1-based option index (``2``), while the model often
++    # emits the corresponding letter (``B``).  This cannot be resolved from
++    # response and label alone, so use the prompt when it is available.
++    if prompt:
++        option_letters = re.findall(r"(?:\\textbf\{)?\(([A-E])\)(?:\})?", prompt, flags=re.IGNORECASE)
++        option_letters = [letter.upper() for letter in option_letters]
++        boxed = last_boxed_only_string(solution_str)
++        candidate = remove_boxed(boxed) if boxed is not None else solution_str.strip()
++        candidate = candidate.strip().strip("$ ").upper()
++        label_text = str(answer).strip().strip("$ ").upper()
++        if len(option_letters) >= 2:
++            candidate_letter = candidate if re.fullmatch(r"[A-E]", candidate) else None
++            label_letter = label_text if re.fullmatch(r"[A-E]", label_text) else None
++            if re.fullmatch(r"[1-5]", label_text):
++                index = int(label_text) - 1
++                label_letter = option_letters[index] if index < len(option_letters) else None
++            if re.fullmatch(r"[A-E]", candidate) and label_letter is not None:
++                return candidate_letter == label_letter, candidate_letter
++            if re.fullmatch(r"[1-5]", candidate) and label_letter is not None:
++                candidate_index = int(candidate) - 1
++                if candidate_index >= len(option_letters):
++                    return False, candidate
++                return option_letters[candidate_index] == label_letter, candidate
++
+     # Prefer math-verify when available.  Unlike the original DAPO checker,
+     # this handles mathematically equivalent fractions, decimals, radicals,
+     # equations, sets, and other non-integer answers.  Prefer the last boxed
+@@ -343,6 +397,7 @@ def compute_score(
+     ground_truth: str,
+     strict_box_verify: bool = False,
+     pause_tokens_index: list[int] | None = None,
++    prompt: str | None = None,
+ ) -> float:
+     """Compute the reward score for a solution.
+ 
+@@ -356,7 +411,7 @@ def compute_score(
+         Reward score (1.0 for correct, -1.0 for incorrect)
+     """
+     # Verify the solution
+-    correct, pred = verify(solution_str, ground_truth, strict_box_verify, pause_tokens_index)
++    correct, pred = verify(solution_str, ground_truth, strict_box_verify, pause_tokens_index, prompt=prompt)
+ 
+     reward = 1.0 if correct else -1.0
+     acc = correct
+diff --git a/slime/rollout/sglang_rollout.py b/slime/rollout/sglang_rollout.py
+index 3dc4d3c3208fb24c5dfe46e9a9d045b1a484f226..bde1eb79325605c55212fb8dcb46763714e1fe38 100644
+--- a/slime/rollout/sglang_rollout.py
++++ b/slime/rollout/sglang_rollout.py
+@@ -260,11 +260,27 @@ async def generate_and_rm(
+     sampling_params: dict[str, Any],
+     evaluation: bool = False,
+ ) -> Sample | list[Sample]:
++    async def evaluate_reward(item: Sample):
++        metadata = item.metadata if isinstance(item.metadata, dict) else {}
++        if evaluation and metadata.get("dataset") == "mbppplus":
++            # MBPP+ eval uses its dataset-owned slime plugin explicitly. This
++            # avoids global/batched RM routing from selecting another judge.
++            from yongxiang.mbppplus_slime_rm import reward as mbppplus_reward
++
++            return await mbppplus_reward(args, item)
++        return await async_rm(args, item)
++
+     # mask previous off-policy generation for partial rollout
+     if args.partial_rollout and args.mask_offpolicy_in_partial_rollout and sample.response_length > 0:
+         sample.loss_mask = [0] * sample.response_length
+ 
+     # For samples with existing response, check if they're complete
++    if evaluation and (sample.status == Sample.Status.COMPLETED or sample.status == Sample.Status.TRUNCATED):
++        assert sample.response is not None
++        if not args.group_rm:
++            sample.reward = await evaluate_reward(sample)
++        return sample
++
+     if sample.status == Sample.Status.COMPLETED or sample.status == Sample.Status.TRUNCATED:
+         assert sample.response is not None
+         if not args.group_rm:
+@@ -316,7 +332,7 @@ async def generate_and_rm(
+         # Some custom generate paths may have already filled the reward.
+         if sample.reward is None:
+             with trace_span(sample, "reward_model"):
+-                sample.reward = await async_rm(args, sample)
++                sample.reward = await evaluate_reward(sample)
+ 
+     return sample
+ 
+diff --git a/slime/utils/data.py b/slime/utils/data.py
+index bc73fd86e5fd0f8a1665fdc4a3d3e289fd142aa7..864238cc6a742169ccd16be905b91143faa3db00 100644
+--- a/slime/utils/data.py
++++ b/slime/utils/data.py
+@@ -281,13 +281,21 @@ class Dataset:
+                 metadata["tools"] = tools
+ 
+             if apply_chat_template:
++                chat_template_kwargs = apply_chat_template_kwargs or {}
+                 output_prompt = tokenizer.apply_chat_template(
+                     prompt,
+                     tools=tools,
+                     tokenize=False,
+                     add_generation_prompt=True,
+-                    **(apply_chat_template_kwargs or {}),
++                    **chat_template_kwargs,
+                 )
++                # Some shipped Qwen3-compatible templates ignore the
++                # ``enable_thinking`` kwarg and always append an opening
++                # ``<think>`` marker. When callers explicitly disable
++                # thinking, remove that marker at the template boundary so
++                # generation starts in the answer channel.
++                if chat_template_kwargs.get("enable_thinking") is False and output_prompt.endswith("<think>\n"):
++                    output_prompt = output_prompt[: -len("<think>\n")]
+             else:
+                 output_prompt = prompt
+ 
+diff --git a/slime/utils/health_monitor.py b/slime/utils/health_monitor.py
+index d7da45c2c380bc9b70d3ed95794f6417d14e12fd..c497d8a1e40c4f7d32bba02d7a179d3ce515c8f5 100644
+--- a/slime/utils/health_monitor.py
++++ b/slime/utils/health_monitor.py
+@@ -2,6 +2,7 @@ import logging
+ import threading
+ 
+ import ray
++import requests
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -21,6 +22,8 @@ class RolloutHealthMonitor:
+ 
+     def __init__(self, server_group, args):
+         self._server_group = server_group
++        self._router_ip = args.sglang_router_ip
++        self._router_port = args.sglang_router_port
+ 
+         self._thread = None
+         self._stop_event = None
+@@ -126,6 +129,7 @@ class RolloutHealthMonitor:
+                 break
+ 
+     def _run_health_checks(self) -> None:
++        self._log_router_workers()
+         for rollout_engine_id, engine in enumerate(self._server_group.engines):
+             if self._stop_event is not None and self._stop_event.is_set():
+                 break
+@@ -133,6 +137,19 @@ class RolloutHealthMonitor:
+                 break
+             self._check_engine_health(rollout_engine_id, engine)
+ 
++    def _log_router_workers(self) -> None:
++        if not self._router_ip or not self._router_port:
++            logger.warning("Router worker snapshot unavailable: router address is not configured")
++            return
++
++        url = f"http://{self._router_ip}:{self._router_port}/workers"
++        try:
++            response = requests.get(url, timeout=self._check_timeout)
++            response.raise_for_status()
++            logger.info("Router worker snapshot: %s", response.json())
++        except Exception:
++            logger.exception("Failed to fetch router worker snapshot from %s", url)
++
+     def _check_engine_health(self, rollout_engine_id, engine) -> None:
+         if engine is None:
+             logger.info(f"Skipping health check for engine {rollout_engine_id} (None)")
+@@ -142,11 +159,14 @@ class RolloutHealthMonitor:
+             ray.get(engine.health_generate.remote(timeout=self._check_timeout))
+         except Exception as e:
+             logger.error(
+-                f"Health check failed for rollout engine {rollout_engine_id} (ray timeout or error). Killing actor. Exception: {e}"
++                "Health check failed for rollout engine %s (ray timeout or error). "
++                "Killing actor. Exception: %s",
++                rollout_engine_id,
++                e,
+             )
+             self._kill_engine(rollout_engine_id=rollout_engine_id)
+         else:
+-            logger.debug(f"Health check passed for rollout engine {rollout_engine_id}")
++            logger.info("Health check passed for rollout engine %s", rollout_engine_id)
+ 
+     def _kill_engine(self, rollout_engine_id: int):
+         logger.info(f"Killing server group {rollout_engine_id}...")
+diff --git a/slime/utils/http_utils.py b/slime/utils/http_utils.py
+index 39c8553875035431964259aa0e81f2b425e06327..2f6c0053dba19c957c37a0febbb90dd4903d813d 100644
+--- a/slime/utils/http_utils.py
++++ b/slime/utils/http_utils.py
+@@ -5,6 +5,8 @@ import logging
+ import os
+ import random
+ import socket
++import time
++import uuid
+ 
+ import httpx
+ 
+@@ -146,12 +148,26 @@ def _next_actor():
+ 
+ async def _post(client, url, payload, max_retries=60, headers=None):
+     retry_count = 0
++    request_headers = dict(headers or {})
++    if url.endswith("/generate"):
++        request_headers.setdefault("x-request-id", uuid.uuid4().hex)
++    request_id = request_headers.get("x-request-id")
++    request_started = time.monotonic()
+     while retry_count < max_retries:
+         response = None
+         try:
+-            response = await client.post(url, json=payload or {}, headers=headers)
++            response = await client.post(url, json=payload or {}, headers=request_headers)
+             response.raise_for_status()
+             content = await response.aread()
++            elapsed = time.monotonic() - request_started
++            if elapsed >= 30:
++                logger.warning(
++                    "Slow HTTP POST succeeded: request_id=%s, status=%s, elapsed=%.1fs, url=%s",
++                    request_id,
++                    response.status_code,
++                    elapsed,
++                    url,
++                )
+             try:
+                 output = json.loads(content)
+             except json.JSONDecodeError:
+@@ -160,12 +176,24 @@ async def _post(client, url, payload, max_retries=60, headers=None):
+             retry_count += 1
+ 
+             if isinstance(e, httpx.HTTPStatusError):
+-                response_text = e.response.text
++                response_text = e.response.text[:2048]
++                response_headers = {
++                    name: e.response.headers[name]
++                    for name in ("x-request-id", "retry-after", "server")
++                    if name in e.response.headers
++                }
++                status_code = e.response.status_code
+             else:
+                 response_text = None
++                response_headers = {}
++                status_code = None
+ 
+             logger.info(
+-                f"Error: {e}, retrying... (attempt {retry_count}/{max_retries}, url={url}, response={response_text})"
++                "HTTP POST failed: "
++                f"request_id={request_id}, status={status_code}, "
++                f"elapsed={time.monotonic() - request_started:.1f}s, error={e}, "
++                f"attempt={retry_count}/{max_retries}, url={url}, "
++                f"response_headers={response_headers}, response={response_text!r}"
+             )
+             if retry_count >= max_retries:
+                 logger.info(f"Max retries ({max_retries}) reached, failing... (url={url})")
+diff --git a/slime_plugins/models/yulan_moe.py b/slime_plugins/models/yulan_moe.py
+index 703346160b5ae6c11312a1cc83018272b1cdf6aa..9044572ffdbb83da56cb3f9e73cf68e9fd463df2 100644
+--- a/slime_plugins/models/yulan_moe.py
++++ b/slime_plugins/models/yulan_moe.py
+@@ -1,14 +1,22 @@
+ """Megatron model provider for the local YuLan-MoE Qwen3-Next checkpoint."""
+ 
+ import copy
++import os
++from contextlib import nullcontext
+ from dataclasses import dataclass
+ 
+ import torch
+ 
+ from megatron.core.models.mamba import MambaModel
++from megatron.core.enums import Fp8Recipe
++from megatron.core.fp8_utils import get_fp8_context
++from megatron.core.inference.contexts import BaseInferenceContext
+ from megatron.core.ssm.mamba_block import MambaStack, MambaStackSubmodules
++from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols, allocate_layers
++from megatron.core.transformer.transformer_block import TransformerBlock, TransformerBlockSubmodules
+ from megatron.core.transformer.spec_utils import ModuleSpec
+ from megatron.core.transformer.transformer_layer import TransformerLayer
++from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
+ from megatron.training import get_args
+ from megatron.training.arguments import core_transformer_config_from_args
+ from megatron_patch.model.qwen3_next.layer_specs import _gdn_layer_spec, get_qwen3_next_layer_spec
+@@ -64,19 +72,149 @@ class _YuLanMambaStack(MambaStack):
+                 dtype=self.config.params_dtype,
+             )
+ 
++    def forward(
++        self,
++        hidden_states,
++        attention_mask,
++        inference_context: BaseInferenceContext = None,
++        rotary_pos_emb=None,
++        *,
++        inference_params: BaseInferenceContext = None,
++    ):
++        """Run the native stack while forwarding Slime's packed THD metadata.
++
++        The base MambaStack predates YuLan's packed-THD CP path and drops
++        ``packed_seq_params`` before calling TransformerLayer.  The actor uses
++        a common Megatron forward API, so keep the compatibility state on this
++        local subclass and pass it to every GDN/MoE layer.
++        """
++        packed_seq_params = getattr(self, "_slime_packed_seq_params", None)
++        padding_mask = getattr(self, "_slime_padding_mask", None)
++        inference_context = deprecate_inference_params(inference_context, inference_params)
++        if not self.pre_process:
++            hidden_states = self.input_tensor
++        if isinstance(hidden_states, WrappedTensor):
++            hidden_states = hidden_states.unwrap()
++        if inference_context:
++            assert inference_context.is_static_batching(), "Mamba currently does not support dynamic inference batching."
++            inference_context.max_seqlen = inference_context.max_sequence_length
++            inference_context.seqlen_offset = inference_context.sequence_len_offset
++        if (
++            ((self.config.cuda_graph_impl == "local" and "full_iteration" not in self.config.cuda_graph_scope)
++             or self.config.flash_decode)
++            and inference_context
++            and inference_context.is_static_batching()
++            and not self.training
++        ):
++            sequence_len_offset = torch.tensor(
++                [inference_context.sequence_len_offset] * hidden_states.shape[1],
++                dtype=torch.int32,
++                device="cuda",
++            )
++        else:
++            sequence_len_offset = None
++        use_outer_fp8_context = self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.delayed
++        use_inner_fp8_context = self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed
++        outer_fp8_context = get_fp8_context(self.config) if use_outer_fp8_context else nullcontext()
++        with outer_fp8_context:
++            for layer in self.layers:
++                inner_fp8_context = (
++                    get_fp8_context(self.config, layer.layer_number - 1)
++                    if use_inner_fp8_context else nullcontext()
++                )
++                with inner_fp8_context:
++                    if isinstance(layer, TransformerLayer):
++                        hidden_states, _ = layer(
++                            hidden_states=hidden_states,
++                            attention_mask=attention_mask,
++                            inference_context=inference_context,
++                            rotary_pos_emb=rotary_pos_emb,
++                            sequence_len_offset=sequence_len_offset,
++                            packed_seq_params=packed_seq_params,
++                            padding_mask=padding_mask,
++                        )
++                    else:
++                        hidden_states = layer(
++                            hidden_states=hidden_states,
++                            attention_mask=attention_mask,
++                            inference_context=inference_context,
++                        )
++                if isinstance(hidden_states, tuple):
++                    hidden_states = hidden_states[0]
++        if self.post_process and self.post_layer_norm:
++            hidden_states = self.final_norm(hidden_states)
++        return make_viewless_tensor(
++            inp=hidden_states,
++            requires_grad=hidden_states.requires_grad,
++            keep_graph=True,
++        )
++
++
++class _YuLanTransformerBlock(TransformerBlock):
++    """TransformerBlock adapter that preserves the MambaModel constructor ABI.
++
++    YuLan's GDN CP implementation performs layout transitions around the whole
++    transformer block.  The normal MambaStack iterates layers itself and cannot
++    run that block-level protocol, so this opt-in adapter uses the existing
++    TransformerBlock implementation while accepting MambaStack's constructor
++    arguments and checkpoint layout.
++    """
++
++    def __init__(
++        self,
++        config,
++        submodules,
++        residual_in_fp32=False,
++        pre_process=True,
++        hybrid_attention_ratio=0.0,
++        hybrid_mlp_ratio=0.0,
++        hybrid_override_pattern=None,
++        post_layer_norm=True,
++        post_process=True,
++        device=None,
++        dtype=None,
++        pg_collection=None,
++        vp_stage=None,
++    ):
++        del residual_in_fp32, hybrid_attention_ratio, hybrid_mlp_ratio
++        del hybrid_override_pattern, device, dtype
++        super().__init__(
++            config=config,
++            spec=submodules,
++            post_layer_norm=post_layer_norm,
++            pre_process=pre_process,
++            post_process=post_process,
++            pg_collection=pg_collection,
++            vp_stage=vp_stage,
++        )
++
++    def forward(self, *args, **kwargs):
++        packed_seq_params = getattr(self, "_slime_packed_seq_params", None)
++        padding_mask = getattr(self, "_slime_padding_mask", None)
++        kwargs.setdefault("packed_seq_params", packed_seq_params)
++        kwargs.setdefault("padding_mask", padding_mask)
++        return super().forward(*args, **kwargs)
++
+ 
+ class _YuLanMambaModel(MambaModel):
+     """Match the converter's omission of the native output layer's null state."""
+ 
+-    def forward(self, *args, packed_seq_params=None, loss_mask=None, **kwargs):
++    def forward(self, *args, packed_seq_params=None, loss_mask=None, padding_mask=None, **kwargs):
+         """Accept slime's packed-batch arguments used by Transformer models.
+ 
+         MambaModel consumes the packed sequence layout through the normal token
+         tensors and does not expose these Transformer-specific keyword arguments.
+         They are nevertheless supplied by slime's common Megatron train path.
+         """
+-        del packed_seq_params, loss_mask
+-        return super().forward(*args, **kwargs)
++        del loss_mask
++        decoder = self.decoder
++        decoder._slime_packed_seq_params = packed_seq_params
++        decoder._slime_padding_mask = padding_mask
++        try:
++            return super().forward(*args, **kwargs)
++        finally:
++            decoder._slime_packed_seq_params = None
++            decoder._slime_padding_mask = None
+ 
+     def sharded_state_dict(self, *args, **kwargs):
+         state_dict = super().sharded_state_dict(*args, **kwargs)
+@@ -103,9 +241,7 @@ def _get_yulan_stack_spec(args):
+         TESpecProvider(normalization=args.normalization),
+         args.normalization,
+     )
+-    return ModuleSpec(
+-        module=_YuLanMambaStack,
+-        submodules=MambaStackSubmodules(
++    stack_submodules = MambaStackSubmodules(
+             mamba_layer=ModuleSpec(
+                 module=_YuLanGDNLayer,
+                 submodules=_YuLanGDNSubmodules(
+@@ -115,8 +251,33 @@ def _get_yulan_stack_spec(args):
+             ),
+             attention_layer=stack_spec.submodules.attention_layer,
+             mlp_layer=stack_spec.submodules.mlp_layer,
+-        ),
+-    )
++        )
++    if os.environ.get("SLIME_USE_YULAN_TRANSFORMER_BLOCK", "").lower() in {
++        "1",
++        "true",
++        "yes",
++    }:
++        layer_specs = []
++        for layer_type in allocate_layers(
++            args.num_layers,
++            args.hybrid_attention_ratio,
++            args.hybrid_mlp_ratio,
++            args.hybrid_override_pattern,
++        ):
++            layer_specs.append(
++                {
++                    Symbols.MAMBA: stack_submodules.mamba_layer,
++                    Symbols.ATTENTION: stack_submodules.attention_layer,
++                    Symbols.MLP: stack_submodules.mlp_layer,
++                }[layer_type]
++            )
++        from megatron.core.extensions.transformer_engine import TENorm
++
++        return ModuleSpec(
++            module=_YuLanTransformerBlock,
++            submodules=TransformerBlockSubmodules(layer_specs=layer_specs, layer_norm=TENorm),
++        )
++    return ModuleSpec(module=_YuLanMambaStack, submodules=stack_submodules)
+ 
+ 
+ def model_provider(pre_process: bool = True, post_process: bool = True, vp_stage: int | None = None):
+diff --git a/tests/test_apps_rm.py b/tests/test_apps_rm.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7b322a96ef635a542ff453248e3942a969a0aa0b
+--- /dev/null
++++ b/tests/test_apps_rm.py
+@@ -0,0 +1,26 @@
++import asyncio
++import json
++from types import SimpleNamespace
++
++from yongxiang.apps_rm import compute_score, reward
++
++
++def _label():
++    return json.dumps({"task_id": "test/0", "inputs": ["2\n", "5\n"], "outputs": ["4\n", "25\n"]})
++
++
++def test_apps_correct_program_passes():
++    result = compute_score("```python\nprint(int(input()) ** 2)\n```", _label())
++    assert result["acc"] is True
++    assert result["status"] == "passed"
++
++
++def test_apps_wrong_answer_is_reported():
++    result = compute_score("print(int(input()))", _label())
++    assert result["acc"] is False
++    assert result["status"] == "wrong_answer"
++
++
++def test_apps_reward_contract():
++    sample = SimpleNamespace(response="print(int(input()) ** 2)", label=_label())
++    assert asyncio.run(reward(None, sample))["acc"] is True
+diff --git a/tests/test_bigcodebench_rm.py b/tests/test_bigcodebench_rm.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4a513512738b02a70d619c68d61740688e9ffa1b
+--- /dev/null
++++ b/tests/test_bigcodebench_rm.py
+@@ -0,0 +1,56 @@
++import asyncio
++import json
++from types import SimpleNamespace
++
++from yongxiang.bigcodebench_rm import compute_score, reward
++
++
++TEST_CODE = """
++import unittest
++
++class TestCases(unittest.TestCase):
++    def test_add_one(self):
++        self.assertEqual(task_func(4), 5)
++"""
++
++
++def _label(test_code: str = TEST_CODE) -> str:
++    return json.dumps({
++        "task_id": "BigCodeBench/test",
++        "entry_point": "task_func",
++        "test": test_code,
++        "libs": [],
++    })
++
++
++def test_correct_solution_passes():
++    result = compute_score("```python\ndef task_func(value):\n    return value + 1\n```", _label())
++    assert result["acc"] is True
++    assert result["status"] == "passed"
++
++
++def test_incorrect_solution_runs_tests_and_fails():
++    result = compute_score("def task_func(value):\n    return value", _label())
++    assert result["acc"] is False
++    assert result["status"] == "failed"
++    assert "FAILED" in result["stderr"]
++
++
++def test_reasoning_and_generation_markers_are_removed():
++    response = "<think>reasoning</think>\n```python\ndef task_func(value):\n    return value + 1\n```\n<|im_end|>"
++    assert compute_score(response, _label())["acc"] is True
++
++
++def test_no_tests_is_not_a_pass():
++    result = compute_score("def task_func(value):\n    return value", _label("import unittest\n"))
++    assert result["acc"] is False
++    assert result["status"] == "no_tests"
++
++
++def test_async_reward_contract():
++    sample = SimpleNamespace(
++        response="def task_func(value):\n    return value + 1",
++        label=_label(),
++    )
++    result = asyncio.run(reward(None, sample))
++    assert result["acc"] is True
+diff --git a/tests/test_code_utils.py b/tests/test_code_utils.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..88923aa5e53e27b3e1680ade8e4829393cf2bc7f
+--- /dev/null
++++ b/tests/test_code_utils.py
+@@ -0,0 +1,91 @@
++from slime.rollout.rm_hub.code_utils import _extract_code, compute_score
++
++
++NUM_GPUS = 0
++
++
++def test_extract_code_ignores_inline_fence_mentions():
++    response = """Explain that the answer belongs in a ```python code block.
++
++```python
++def solve(value):
++    return value + 1
++```
++"""
++    assert _extract_code(response, "solve") == "def solve(value):\n    return value + 1"
++
++
++def test_extract_code_prefers_block_with_entry_point():
++    response = """```python
++def unrelated(value):
++    return value
++```
++
++```python
++def solve(value):
++    return value + 1
++```
++<|im_end|>"""
++    assert "def solve(value):" in _extract_code(response, "solve")
++
++
++def test_extract_code_removes_reasoning_markers():
++    response = """<think>reasoning that should not be executed</think>
++```python
++def solve(value):
++    return value + 1
++```
++<|im_end|>"""
++    assert _extract_code(response, "solve") == "def solve(value):\n    return value + 1"
++
++
++def test_extract_code_handles_prompt_reasoning_prefix():
++    response = """Reasoning from the assistant\n</think>\n\n```python\ndef solve(value):\n    return value + 1\n```"""
++    assert _extract_code(response, "solve") == "def solve(value):\n    return value + 1"
++
++
++def test_extract_code_recovers_unfenced_entry_point():
++    response = """The implementation is:
++
++def solve(value):
++    return value + 1
++"""
++    assert _extract_code(response, "solve").startswith("def solve(value):")
++
++
++def test_extract_code_rejects_reasoning_without_entry_point():
++    response = "We need to reason about the implementation before writing code."
++    assert _extract_code(response, "solve") == ""
++
++
++def test_compute_score_runs_tests_without_check_wrapper():
++    label = {
++        "entry_point": "solve",
++        "test": "assert solve(1) == 2\nassert solve(3) == 4",
++    }
++    result = compute_score("```python\ndef solve(value):\n    return value + 1\n```", label)
++    assert result["acc"] is True
++
++
++def test_compute_score_keeps_humaneval_check_wrapper():
++    label = {
++        "entry_point": "solve",
++        "test": "def check(candidate):\n    assert candidate(1) == 2",
++    }
++    result = compute_score("def solve(value):\n    return value + 1", label)
++    assert result["acc"] is True
++
++
++def test_compute_score_handles_end_marker_after_fence():
++    label = {
++        "entry_point": "solve",
++        "test": "assert solve(1) == 2",
++    }
++    response = "```python\ndef solve(value):\n    return value + 1\n```<|im_end|>"
++    assert compute_score(response, label)["acc"] is True
++
++
++if __name__ == "__main__":
++    import pytest
++
++    raise SystemExit(pytest.main([__file__]))
+diff --git a/tests/test_convert_taco_cobalt.py b/tests/test_convert_taco_cobalt.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b33ba023b293f1d500a76c52153b581e313a1a77
+--- /dev/null
++++ b/tests/test_convert_taco_cobalt.py
+@@ -0,0 +1,44 @@
++import importlib.util
++import json
++from pathlib import Path
++
++
++MODULE_PATH = Path(__file__).parents[1] / "yongxiang" / "scripts" / "convert-taco-cobalt.py"
++SPEC = importlib.util.spec_from_file_location("convert_taco_cobalt", MODULE_PATH)
++MODULE = importlib.util.module_from_spec(SPEC)
++assert SPEC.loader is not None
++SPEC.loader.exec_module(MODULE)
++
++
++def _row(task_id: int, difficulty: str) -> dict:
++    cases = {"inputs": [f"{task_id}\n"], "outputs": [f"{task_id}\n"]}
++    encoded = json.dumps(cases)
++    return {
++        "id": task_id,
++        "difficulty": difficulty,
++        "instruction": f"Solve task {task_id}",
++        "test_cases": encoded,
++        "public_test_cases": encoded,
++        "hidden_test_cases": encoded,
++    }
++
++
++def test_convert_samples_train_rows_deterministically(tmp_path):
++    source = tmp_path / "source"
++    source.mkdir()
++    rows = [_row(task_id, "EASY" if task_id % 2 else "HARD") for task_id in range(10)]
++    (source / "train.jsonl").write_text(
++        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
++    )
++
++    first = tmp_path / "first.jsonl"
++    second = tmp_path / "second.jsonl"
++    ids = MODULE.convert(source, first, "train", 3, 42, "hidden", {"HARD"})
++    assert ids == MODULE.convert(source, second, "train", 3, 42, "hidden", {"HARD"})
++    assert first.read_bytes() == second.read_bytes()
++
++    records = [json.loads(line) for line in first.read_text(encoding="utf-8").splitlines()]
++    assert len(records) == 3
++    assert all(record["metadata"]["split"] == "train" for record in records)
++    assert all(record["metadata"]["difficulty"] == "HARD" for record in records)
++    assert all(record["metadata"]["test_split"] == "hidden" for record in records)
+diff --git a/tests/test_data.py b/tests/test_data.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..359992585cb749c991984a337ab96907bafa3009
+--- /dev/null
++++ b/tests/test_data.py
+@@ -0,0 +1,30 @@
++import json
++
++from slime.utils.data import Dataset
++
++
++class _Tokenizer:
++    def apply_chat_template(self, prompt, **kwargs):
++        assert kwargs["enable_thinking"] is False
++        return "rendered<|im_start|>assistant\n<think>\n"
++
++    def __call__(self, prompts, add_special_tokens=False):
++        return {"input_ids": [[1] for _ in prompts]}
++
++
++def test_disabled_thinking_removes_ignored_template_marker(tmp_path):
++    path = tmp_path / "prompts.jsonl"
++    path.write_text(json.dumps({"query": "solve", "answer": "label"}) + "\n", encoding="utf-8")
++
++    dataset = Dataset(
++        str(path),
++        _Tokenizer(),
++        None,
++        max_length=None,
++        prompt_key="query",
++        label_key="answer",
++        apply_chat_template=True,
++        apply_chat_template_kwargs={"enable_thinking": False},
++    )
++
++    assert dataset.samples[0].prompt == "rendered<|im_start|>assistant\n"
+diff --git a/tests/test_rejudge_task_summary.py b/tests/test_rejudge_task_summary.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5366ae71444ee23a78a54db50e5f35f86c69fd99
+--- /dev/null
++++ b/tests/test_rejudge_task_summary.py
+@@ -0,0 +1,36 @@
++import importlib.util
++import json
++from pathlib import Path
++
++
++MODULE_PATH = Path(__file__).parents[1] / "yongxiang" / "scripts" / "rejudge-code-rollout.py"
++SPEC = importlib.util.spec_from_file_location("rejudge_code_rollout", MODULE_PATH)
++MODULE = importlib.util.module_from_spec(SPEC)
++assert SPEC.loader is not None
++SPEC.loader.exec_module(MODULE)
++
++
++def test_task_summary_classification(tmp_path, monkeypatch, capsys):
++    class FakeTorch:
++        @staticmethod
++        def load(*args, **kwargs):
++            return {
++                "samples": [
++                    {"response": "a", "label": "x", "metadata": {"task_id": 1, "difficulty": "EASY"}},
++                    {"response": "b", "label": "x", "metadata": {"task_id": 1, "difficulty": "EASY"}},
++                    {"response": "c", "label": "x", "metadata": {"task_id": 2, "difficulty": "HARD"}},
++                    {"response": "d", "label": "x", "metadata": {"task_id": 2, "difficulty": "HARD"}},
++                ]
++            }
++
++    monkeypatch.setattr(MODULE, "torch", FakeTorch)
++    monkeypatch.setattr(MODULE, "load_judge", lambda path: lambda response, label: {"acc": response == "a", "score": 1})
++    summary_path = tmp_path / "summary.jsonl"
++    monkeypatch.setattr(
++        "sys.argv",
++        ["rejudge-code-rollout.py", "rollout.pt", "--task-summary", str(summary_path)],
++    )
++    MODULE.main()
++    assert json.loads(summary_path.read_text().splitlines()[0])["classification"] == "mixed"
++    assert json.loads(summary_path.read_text().splitlines()[1])["classification"] == "all_wrong"
++    assert "all_wrong" in capsys.readouterr().out
+diff --git a/tests/test_rm_math_dapo.py b/tests/test_rm_math_dapo.py
+index fd38c9851d7e6ac86ffd81f3e65812f2c3e64b8b..14d11d3604d11ae797579f94cd4d30ef9b670549 100644
+--- a/tests/test_rm_math_dapo.py
++++ b/tests/test_rm_math_dapo.py
+@@ -48,6 +48,12 @@ def test_last_boxed_balances_nested_braces():
+     assert last_boxed_only_string(r"\boxed{\frac{1}{2}}") == r"\boxed{\frac{1}{2}}"
+ 
+ 
++@pytest.mark.unit
++def test_last_boxed_accepts_fbox():
++    assert last_boxed_only_string(r"\fbox{42}") == r"\fbox{42}"
++    assert remove_boxed(r"\fbox{42}") == "42"
++
++
+ @pytest.mark.unit
+ def test_last_boxed_returns_none_when_missing():
+     assert last_boxed_only_string("no box") is None
+@@ -161,6 +167,13 @@ def test_is_correct_minerva_matches_int_answer():
+     assert pred == "42"
+ 
+ 
++@pytest.mark.unit
++def test_is_correct_minerva_accepts_answer_is():
++    correct, pred = is_correct_minerva("The answer is 42", "42")
++    assert correct is True
++    assert pred == "42"
++
++
+ @pytest.mark.unit
+ def test_is_correct_minerva_takes_last_answer_match():
+     """Multiple ``Answer:`` lines → ``re.findall`` returns the list and
+@@ -219,6 +232,28 @@ def test_verify_accepts_bare_latex_fraction_label():
+     assert correct is True
+ 
+ 
++@pytest.mark.unit
++def test_verify_maps_multiple_choice_letter_to_numeric_label():
++    prompt = r"Compute the value. \textbf{(A)} 16:9 \textbf{(B)} 9:16 \textbf{(C)} 4:3"
++    correct, pred = verify(r"\boxed{B}", "2", prompt=prompt)
++    assert correct is True
++    assert pred == "B"
++
++
++@pytest.mark.unit
++def test_verify_rejects_numeric_choice_outside_prompt_options():
++    prompt = r"Choose one. (A) first (B) second (C) third (D) fourth"
++    correct, pred = verify(r"\boxed{5}", "2", prompt=prompt)
++    assert correct is False
++    assert pred == "5"
++
++
++@pytest.mark.unit
++def test_verify_accepts_degree_and_radian_equivalence():
++    correct, _ = verify(r"\boxed{60^\circ}", r"\frac{\pi}{3}")
++    assert correct is True
++
++
+ @pytest.mark.unit
+ def test_compute_score_correct_returns_dict_with_reward_one():
+     """Public API contract: dict shape with {score, acc, pred} keys."""
+diff --git a/tools/plot_math_rl_curves.py b/tools/plot_math_rl_curves.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9ab60f619cda8d9cb00cdd282a02ea97c071a276
+--- /dev/null
++++ b/tools/plot_math_rl_curves.py
+@@ -0,0 +1,168 @@
++#!/usr/bin/env python3
++"""Plot publication-style curves from a slime Math RL log."""
++
++from __future__ import annotations
++
++import argparse
++import ast
++import re
++from pathlib import Path
++
++import matplotlib as mpl
++import matplotlib.pyplot as plt
++import numpy as np
++
++
++TRAIN_RE = re.compile(r"model\.py:\d+ - step (\d+): (\{.*\})")
++EVAL_RE = re.compile(r"rollout_metrics\.py:\d+ - eval (\d+): (\{.*\})")
++ROLLOUT_RE = re.compile(r"rollout_metrics\.py:\d+ - perf (\d+): (\{.*\})")
++
++
++def parse_records(path: Path, pattern: re.Pattern[str]) -> list[tuple[int, dict]]:
++    records = []
++    for match in pattern.finditer(path.read_text(errors="replace")):
++        try:
++            records.append((int(match.group(1)), ast.literal_eval(match.group(2))))
++        except (SyntaxError, ValueError):
++            continue
++    return records
++
++
++def moving_average(values: list[float], window: int = 5) -> np.ndarray:
++    array = np.asarray(values, dtype=float)
++    if len(array) < 2:
++        return array
++    window = min(window, len(array))
++    kernel = np.ones(window) / window
++    padded = np.pad(array, (window - 1, 0), mode="edge")
++    return np.convolve(padded, kernel, mode="valid")
++
++
++def ema(values: list[float], alpha: float = 0.25) -> np.ndarray:
++    array = np.asarray(values, dtype=float)
++    if len(array) == 0:
++        return array
++    output = np.empty_like(array)
++    output[0] = array[0]
++    for index in range(1, len(array)):
++        output[index] = alpha * array[index] + (1 - alpha) * output[index - 1]
++    return output
++
++
++def get_values(records: list[tuple[int, dict]], key: str) -> tuple[list[int], list[float]]:
++    points = [(step, float(metrics[key])) for step, metrics in records if key in metrics]
++    if not points:
++        return [], []
++    steps, values = zip(*points)
++    return list(steps), list(values)
++
++
++def style() -> None:
++    mpl.rcParams.update(
++        {
++            "font.family": "DejaVu Sans",
++            "font.size": 9,
++            "axes.titlesize": 10,
++            "axes.labelsize": 9,
++            "axes.linewidth": 0.8,
++            "xtick.labelsize": 8,
++            "ytick.labelsize": 8,
++            "legend.fontsize": 8,
++            "figure.dpi": 150,
++            "savefig.dpi": 300,
++            "savefig.bbox": "tight",
++            "axes.spines.top": False,
++            "axes.spines.right": False,
++            "axes.grid": True,
++            "grid.color": "#D9DEE7",
++            "grid.linewidth": 0.6,
++            "grid.alpha": 0.65,
++        }
++    )
++
++
++def plot(log_path: Path, output_prefix: Path) -> None:
++    train = parse_records(log_path, TRAIN_RE)
++    evaluation = parse_records(log_path, EVAL_RE)
++    rollout = parse_records(log_path, ROLLOUT_RE)
++    if not train:
++        raise RuntimeError(f"No train metrics found in {log_path}")
++
++    style()
++    colors = {"blue": "#2455A4", "orange": "#D97904", "green": "#2A7F62", "red": "#B23A48"}
++    fig, axes = plt.subplots(2, 2, figsize=(7.25, 5.05), constrained_layout=True)
++
++    # Panel A: eval accuracy. Keep raw points visible because eval is only avg@2.
++    ax = axes[0, 0]
++    for key, label, color in [
++        ("eval/aime2024", "AIME 2024", colors["blue"]),
++        ("eval/aime2025", "AIME 2025", colors["orange"]),
++    ]:
++        x, y = get_values(evaluation, key)
++        if x:
++            ax.plot(x, y, "o", ms=3.2, alpha=0.34, color=color)
++            ax.plot(x, moving_average(y, 3), lw=2.0, color=color, label=label)
++    ax.set_title("Evaluation accuracy (avg@2)", loc="left", fontweight="bold")
++    ax.set_xlabel("Rollout step")
++    ax.set_ylabel("Accuracy")
++    ax.set_ylim(0.2, 0.7)
++    ax.legend(frameon=False, ncol=2, loc="lower right")
++
++    # Panel B: train / rollout mismatch.
++    ax = axes[0, 1]
++    x, y = get_values(train, "train/train_rollout_logprob_abs_diff")
++    ax.plot(x, y, "o", ms=2.8, alpha=0.28, color=colors["red"])
++    ax.plot(x, ema(y, 0.22), lw=2.0, color=colors["red"], label="EMA")
++    ax.set_title("Train–rollout logprob mismatch", loc="left", fontweight="bold")
++    ax.set_xlabel("Train step")
++    ax.set_ylabel("Mean absolute difference")
++    ax.legend(frameon=False, loc="upper right")
++
++    # Panel C: useful GRPO groups. Zero-std counts are measured among 32 groups.
++    ax = axes[1, 0]
++    x, positive = get_values(rollout, "rollout/zero_std/count_1.0")
++    _, negative = get_values(rollout, "rollout/zero_std/count_-1.0")
++    if positive and negative:
++        informative = [32 - p - n for p, n in zip(positive, negative, strict=True)]
++        ax.plot(x, informative, "o", ms=2.8, alpha=0.28, color=colors["green"])
++        ax.plot(x, moving_average(informative, 5), lw=2.0, color=colors["green"], label="smoothed")
++    ax.axhline(32, color="#777777", lw=0.8, ls="--", label="all 32 groups")
++    ax.set_title("Groups with non-zero reward variance", loc="left", fontweight="bold")
++    ax.set_xlabel("Rollout step")
++    ax.set_ylabel("Groups / 32")
++    ax.set_ylim(0, 34)
++    ax.legend(frameon=False, loc="lower right")
++
++    # Panel D: truncation, train versus eval.
++    ax = axes[1, 1]
++    x, y = get_values(rollout, "rollout/truncated_ratio")
++    ax.plot(x, y, "o", ms=2.8, alpha=0.24, color=colors["blue"])
++    ax.plot(x, moving_average(y, 5), lw=2.0, color=colors["blue"], label="train rollout")
++    x_eval, y_eval = get_values(evaluation, "eval/aime2024-truncated_ratio")
++    if x_eval:
++        ax.plot(x_eval, y_eval, "o", ms=2.8, alpha=0.28, color=colors["orange"])
++        ax.plot(x_eval, moving_average(y_eval, 3), lw=2.0, color=colors["orange"], label="AIME 2024 eval")
++    ax.set_title("Response truncation", loc="left", fontweight="bold")
++    ax.set_xlabel("Rollout step")
++    ax.set_ylabel("Ratio")
++    ax.set_ylim(0, 0.75)
++    ax.legend(frameon=False, loc="upper right")
++
++    fig.suptitle("YuLan MoE Math RL — training dynamics", fontsize=11, fontweight="bold", x=0.02, ha="left")
++    fig.text(0.02, 0.005, f"Source: {log_path.name}; points are raw, lines are light smoothing.", fontsize=7.5, color="#596273")
++    output_prefix.parent.mkdir(parents=True, exist_ok=True)
++    fig.savefig(output_prefix.with_suffix(".png"))
++    fig.savefig(output_prefix.with_suffix(".pdf"))
++    plt.close(fig)
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("log", type=Path)
++    parser.add_argument("output_prefix", type=Path)
++    args = parser.parse_args()
++    plot(args.log, args.output_prefix)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/train.py b/train.py
+index 7122b1d583f649524ebbceef57a0c7795a489b46..37c4d83b36b1515effcc5f5a14d136c38992e260 100644
+--- a/train.py
++++ b/train.py
+@@ -19,7 +19,8 @@ def train(args):
+     # need to initialize rollout manager first to calculate num_rollout
+     rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"])
+ 
+-    if args.rebuild_train_actors:
++    defer_actor_init = args.rebuild_train_actors or args.destroy_rollout_engines
++    if defer_actor_init:
+         # actor.init() is intentionally deferred until after the first rollout
+         # engines are destroyed.  Normally actor.init() publishes this config,
+         # but generate() needs it earlier to split replay data by DP rank.
+@@ -35,7 +36,7 @@ def train(args):
+ 
+     actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
+ 
+-    if args.rebuild_train_actors:
++    if defer_actor_init:
+         # The first rollout is served directly from the HF checkpoint. Keep
+         # the training actor out of GPU memory until rollout data is ready.
+         actor_model.release()
+@@ -77,7 +78,9 @@ def train(args):
+         elif args.offload_rollout:
+             ray.get(rollout_manager.offload.remote())
+ 
+-        if release_train or args.rebuild_train_actors:
++        if release_train or args.rebuild_train_actors or (
++            args.destroy_rollout_engines and rollout_id == args.start_rollout_id
++        ):
+             actor_model.create()
+ 
+         actor_trains = (not args.use_critic) or rollout_id >= args.num_critic_only_steps
