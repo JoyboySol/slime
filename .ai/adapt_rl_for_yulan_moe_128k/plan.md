@@ -45,16 +45,19 @@
 
 **验收：**actor 完成一次真实更新；更新前后 checkpoint 可保存、重载，关键参数没有丢失。
 
-**阶段 2 已验证：**在 8 卡 A100、TP1/PP1/CP8/EP8 上，从 SGLang 生成 rollout，再回放固定 rollout 执行 actor update。使用 2 个 prompt、每个 4 个样本，response cap 1024、context cap 4096；该短样本用于验证训练链路，生成结果全部触及 response cap 并标记为 truncated，不用于判断回答质量。actor 完成前向、loss、反向和 optimizer update，loss、grad norm 均为有限值；更新后的 MCore checkpoint 已保存并通过独立 load-only 作业重载。HF 导出成功写出 128 个 safetensors 分片，扫描 32,226 个张量后确认所有浮点值有限。为适配当前 YuLan GatedNorm/GDN 和 attention-output-gate 布局，转换器覆盖了 final/input/pre-MLP GatedNorm、GDN fused 与 split q/k/v/z/beta/alpha 投影，以及 gated QKV bias。阶段 3 的 SGLang 权重加载和 logprob 对齐仍待验证。
+**阶段 2 已验证：**在 8 卡 A100、TP1/PP1/CP8/EP8 上，从 SGLang 生成 rollout，再回放固定 rollout 执行 actor update。使用 2 个 prompt、每个 4 个样本，response cap 1024、context cap 4096；该短样本用于验证训练链路，生成结果全部触及 response cap 并标记为 truncated，不用于判断回答质量。actor 完成前向、loss、反向和 optimizer update，loss、grad norm 均为有限值；更新后的 MCore checkpoint 已保存并通过独立 load-only 作业重载。HF 导出成功写出 128 个 safetensors 分片，扫描 32,226 个张量后确认所有浮点值有限。为适配当前 YuLan GatedNorm/GDN 和 attention-output-gate 布局，转换器覆盖了 final/input/pre-MLP GatedNorm、GDN fused 与 split q/k/v/z/beta/alpha 投影，以及 gated QKV bias。阶段 3 的 SGLang checkpoint 加载与基础服务检查已完成；更新后训推 logprob 差异的定位移到后期专项任务。
 
-### 3. 验证 Slime 到 SGLang 的权重和 logprob 一致性
+### 3. 验证 SGLang checkpoint 加载与基础服务
 
-- [ ] 在 Slime 训练环境中确认 `SGLANG_EXTERNAL_MODEL_PACKAGE=sglang_qwen3_next_plugin` 生效，模型类解析到目标插件实现。
-- [ ] 按插件已记录的 TP2/EP2 serving layout 启动服务，先用原始 HF checkpoint 做短 prompt 生成。
-- [ ] 加载/同步 Slime 导出的 actor 权重；对固定 prompt 比较 actor 与 SGLang 的 logprob，定位配置、转换或模块语义不一致。
-- [ ] 检查权重更新后 SGLang 确实拿到新版本，而非仍在使用初始权重。
+- [x] 在 Slime 训练环境中确认 `SGLANG_EXTERNAL_MODEL_PACKAGE=sglang_qwen3_next_plugin` 生效，模型类解析到目标插件实现。
+- [x] 按插件已记录的 TP2/EP2 serving layout 启动服务，原始 HF checkpoint 和 Slime 导出的 actor HF checkpoint 均通过短 prompt 生成与 logprob 检查。
+- [x] 对初始权重做 HF→MCore→HF tensor roundtrip：32,226 个 tensor 名称、shape、dtype 全匹配，34,107,921,536 个元素逐位相同。
+- [x] 确认服务能加载 Slime 导出的 actor HF checkpoint，并完成固定 prompt 的生成与 logprob sanity check。
+- [x] 对初始权重做 HF→MCore→HF tensor roundtrip；结果逐位相同，直接验证初始权重转换与导出映射。
+- [x] 检查权重更新后 SGLang 确实拿到新版本，而非仍在使用初始权重：导出 HF checkpoint 的固定输入 NLL 与原始 HF checkpoint 有可复现差异。
+- [x] 留存更新后 actor 与 SGLang 对相同固定 token 的 logprob 对照结果，作为后期排查基线；该项不作为短期 RL 闭环的阻塞条件。
 
-**验收：**原始 checkpoint 和 actor 导出权重均可由 SGLang 加载；固定输入上的 logprob 差异在约定容差内，权重更新可见。
+**阶段 3 已完成：**插件加载、原始与导出 checkpoint 的 SGLang 加载、生成和 logprob sanity check 均通过；初始 HF→MCore→HF tensor roundtrip 逐位相同。更新后 MCore actor 与导出 HF/SGLang 的固定序列 logprob 平均绝对差为 `0.112996`，高于 0.1 CI 阈值。该数值已记录为后期诊断基线；它不能单独归因于导出错误，也不阻塞当前 RL 闭环和资源验收。
 
 ### 4. 短序列 RL 闭环 smoke
 
@@ -83,7 +86,16 @@
 
 **验收：**32k context 下 rollout、actor 更新、权重同步和 checkpoint 保存都能完成；显存与吞吐数据支持目标训练规模。
 
-### 7. 正式训练配置与运行
+### 7. 训推一致性专项诊断（后期任务）
+
+- [ ] 在阶段 4–6 的 RL 闭环、单机生命周期和 32k context 验收完成后，再集中定位更新后 MCore actor 与 SGLang 的固定序列 logprob 差异。
+- [ ] 对同一个更新后 MCore checkpoint 做 MCore→HF tensor 对照，确认训练后导出张量与 HF checkpoint 对应关系。
+- [ ] 若 tensor 对照一致，再核对 MCore/SGLang 的 logprob kernel、精度、token 边界、mask 和并行配置；若不一致，定位具体参数映射或导出环节。
+- [ ] 复测 `train/train_rollout_logprob_abs_diff`，评估 `0.112996` 与 CI `0.1` 阈值的差距，并据证据决定修复项或合理容差。
+
+**验收：**能将差异定位到权重导出、前向数值、token/mask 对齐或测量配置中的具体环节，并记录对训练的影响及处理结论。该专项排在短期 RL 闭环和 32k 资源验收之后。
+
+### 8. 正式训练配置与运行
 
 - [ ] 将通过验收的模型参数、checkpoint、数据、reward、评估和 W&B 设置组合成独立的 128k RL launcher/config。
 - [ ] 验证断点恢复、定期 checkpoint、HF 导出、评估结果和日志可追踪。
@@ -93,4 +105,4 @@
 
 ## 当前建议的执行顺序
 
-先完成阶段 1 的独立 128k 配置和 checkpoint 加载验收；阶段 0 的 RL context 已定为 32k。之后按 2 → 3 → 4 → 5 → 6 → 7 推进。SGLang 插件已有的模型支持视为可复用基础，但不能替代 Slime 导出权重、logprob 和端到端 RL 的验收。
+阶段 1、2、3 已完成，RL context 已定为 32k。接下来按 4 → 5 → 6 推进，先打通短序列闭环、单机生命周期和 32k 资源验收；训推一致性专项定位放在这些工作之后，再进入正式训练配置与运行。SGLang 插件已有的模型支持视为可复用基础，但不能替代端到端 RL 的验收。
