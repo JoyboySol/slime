@@ -59,24 +59,26 @@
 
 **阶段 3 已完成：**插件加载、原始与导出 checkpoint 的 SGLang 加载、生成和 logprob sanity check 均通过；初始 HF→MCore→HF tensor roundtrip 逐位相同。更新后 MCore actor 与导出 HF/SGLang 的固定序列 logprob 平均绝对差为 `0.112996`，高于 0.1 CI 阈值。该数值已记录为后期诊断基线；它不能单独归因于导出错误，也不阻塞当前 RL 闭环和资源验收。
 
-### 4. 短序列 RL 闭环 smoke
+### 4. 小 batch 单步 RL smoke 与初始模型 AIME24 eval
 
-- [ ] 使用少量可判分样本、短 prompt/response 和小 batch，执行少量 rollout 与训练 step。
-- [ ] 覆盖 tokenizer/chat template、reward、dynamic sampling/filter、GRPO batch 构造、actor update、保存和 rollout 权重同步。
-- [ ] 初次排障时可使用已保存 rollout replay 隔离 actor 问题；之后仍需至少一次真实 SGLang rollout。
-- [ ] 暂不启用长上下文压力、长周期评估和正式训练规模。
+- [x] 用真实 SGLang rollout 执行一次小 batch 训练：2 个 prompt、每个 2 个 sample、global batch 4、1 个 actor microbatch；训练 rollout context 4096、response 上限 1024。
+- [x] 在训练开始前对起始模型运行 AIME 2024 eval：每题采样 2 次、temperature 0.7、总 context 上限 32768（prompt 上限 1024、response 上限 31744）。
+- [x] 完成 GRPO rollout 数据处理、actor train step、MCore checkpoint 保存及 HF checkpoint 导出；训练后重建 SGLang engines 并开始加载更新后的 HF 权重。
+- [x] 限定为短训练 rollout 和一次更新；没有开展长上下文压力测试或正式训练规模验证。
 
-**验收：**一轮完整 RL 闭环成功，reward 和训练指标合理，actor 确有更新，下一轮 rollout 使用更新后的权重。
+**验收标准：**起始模型 AIME 2024 `avg@2` 在 32768 context、temperature 0.7 下约 65 分；单步训练与 checkpoint/权重同步链路跑通。AIME24 得分标准已通过：本次 `eval/aime24 = 0.6667`，即 66.7/100（30 题、共 60 次生成，40 次判对）。训练 smoke 的基础链路已通过，但“有效学习信号”仍待上面的非零 advantage 小样本重跑；20% 的 AIME24 生成达到 31744 response 上限，解读分数时应保留该限制。
+
+**阶段 4 执行记录：**见 [`stage4_one_step_smoke_and_aime24_eval.md`](stage4_one_step_smoke_and_aime24_eval.md)，含启动配置、评测结果、训练指标、产物和停止边界。
 
 ### 5. 单机 rollout/actor 生命周期验收
 
 - [ ] 在 8 卡单机上接入现有 rollout manager 与 colocate 配置。
 - [ ] 核实 route-replay 补丁是否适用于目标 checkpoint 和 YuLan-Pretrain 代码版本；沿用现有 launcher 的安全检查/恢复机制，不覆盖无关本地改动。
-- [ ] 验证 rollout engines 销毁、train actors 重建、actor 更新/保存、rollout engines 再创建的完整顺序。
+- [x] 至少完成一次 rollout engines 销毁、train actors 重建、actor 更新/保存、rollout engines 再创建；Stage 4 日志记录了重建后的 SGLang 请求。
 - [ ] 检查 Ray runtime env 传播、插件导入路径、checkpoint 路径、显存释放和重建后的权重版本。
 - [ ] 连续跑多轮，观察显存是否泄漏、GPU 是否正确分配、训练是否能继续。
 
-**验收：**至少连续完成多个 rollout/train 周期；没有 GPU 资源死锁、持续显存增长或 rollout 使用旧权重的问题。
+**验收：**至少连续完成多个 rollout/train 周期；没有 GPU 资源死锁、持续显存增长或 rollout 使用旧权重的问题。Stage 4 只完成单周期验证，不能替代多轮验收。
 
 ### 6. 验证 32k context 与 token budget
 
@@ -84,7 +86,7 @@
 - [ ] 在 32k 总 context 下验证 SGLang KV cache、MCore CP/GDN、packing、rollout 时长和单机资源生命周期；本次不要求 49k 或 128k RL。
 - [ ] 根据实测结果调整 `rollout-max-prompt-len`、`rollout-max-response-len`、`rollout-max-context-len`、`MAX_TOKENS_PER_GPU`、batch 和 samples 数。
 
-**验收：**32k context 下 rollout、actor 更新、权重同步和 checkpoint 保存都能完成；显存与吞吐数据支持目标训练规模。
+**验收：**32k context 下 rollout、actor 更新、权重同步和 checkpoint 保存都能完成；显存与吞吐数据支持目标训练规模。Stage 4 的 32k 是 AIME24 eval context，不是训练 rollout 长度，因此尚未完成本阶段。
 
 ### 7. 训推一致性专项诊断（后期任务）
 
@@ -105,4 +107,4 @@
 
 ## 当前建议的执行顺序
 
-阶段 1、2、3 已完成，RL context 已定为 32k。接下来按 4 → 5 → 6 推进，先打通短序列闭环、单机生命周期和 32k 资源验收；训推一致性专项定位放在这些工作之后，再进入正式训练配置与运行。SGLang 插件已有的模型支持视为可复用基础，但不能替代端到端 RL 的验收。
+阶段 1–3 已完成。Stage 4 的起始模型 AIME24 基线达到约 65 分的标准，单周期执行和权重重建链路也跑通；有效学习信号与训练后 eval 仍有未完成项。接下来先用有非零 GRPO advantage 的小样本补齐 Stage 4，再完成 Stage 5 多轮单机生命周期验收和 Stage 6 的 32k 训练资源验收。训推一致性专项（Stage 7）继续放在这些工作之后，再进入正式训练配置与运行。SGLang 插件已有的模型支持视为可复用基础，但不能替代端到端 RL 的验收。
